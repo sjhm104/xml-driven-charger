@@ -215,6 +215,15 @@ class DeviceModel:
     def find(self, group_no: int, entry_no: int) -> Group | None:
         return self.groups.get((group_no, entry_no))
 
+    def point_counts(self) -> dict[str, int]:
+        """按点类型统计 XML 中的有效点数量。"""
+        counts = {"YC": 0, "YX": 0, "YK": 0, "FIX": 0}
+        for group in self.groups.values():
+            for point in group.points:
+                if point.kind in counts:
+                    counts[point.kind] += 1
+        return counts
+
     def sorted_groups(self) -> list[Group]:
         return [self.groups[key] for key in sorted(self.groups)]
 

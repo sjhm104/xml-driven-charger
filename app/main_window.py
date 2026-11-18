@@ -132,6 +132,10 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(QLabel("组（功能码 / 子类型）"))
+        self.xml_summary = QLabel("未加载 XML")
+        self.xml_summary.setWordWrap(True)
+        self.xml_summary.setStyleSheet("color: #555;")
+        left_layout.addWidget(self.xml_summary)
         left_layout.addWidget(self.group_list)
 
         # 右侧：点表 + 数据区 + 预览
@@ -427,16 +431,37 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 - 显示给用户即可
             self.device.clear()
             self._refresh_group_list()
+            self.xml_summary.setText("XML 加载失败")
+            self.xml_summary.setToolTip(path)
             self._log("ERR", f"XML 加载失败: {exc}")
             QMessageBox.critical(self, "XML 加载失败", f"{path}\n\n{exc}")
             return
 
         self._refresh_group_list()
+        counts = self.device.point_counts()
+        summary = (
+            f"遥测 {counts['YC']} / 遥信 {counts['YX']} / "
+            f"遥控 {counts['YK']} / 定值 {counts['FIX']}"
+        )
+        self.xml_summary.setText(summary)
+        self.xml_summary.setToolTip(path)
         self._log(
             "INFO",
-            f"已加载 XML: {path} | 组 {len(self.device.groups)} | "
-            f"模板 {len(self.templates)}",
+            f"已加载 XML: {path} | {summary} | 模板 {len(self.templates)}",
         )
+
+        warnings: list[str] = []
+        if not self.device.groups:
+            warnings.append("XML 没有任何有效组")
+        else:
+            if counts["YC"] + counts["YX"] == 0:
+                warnings.append("没有遥测/遥信点（MeasureDefine/SignalDefine 为空）")
+            if counts["YK"] == 0:
+                warnings.append("没有遥控点（ControlDefine 为空）")
+            if counts["FIX"] == 0:
+                warnings.append("没有定值点（FixValDefine/SetPointDefine 为空）")
+        for warning in warnings:
+            self._log("WARN", warning)
 
     def _refresh_group_list(self) -> None:
         self.group_list.blockSignals(True)
