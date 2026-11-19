@@ -217,13 +217,16 @@ def apply_snapshot(
     device: DeviceModel,
     snapshot: dict,
     formats: dict[str, PointFormat] | None = None,
+    group_key: tuple[int, int] | None = None,
 ) -> tuple[int, list[str]]:
-    """把模型状态写到所有能匹配角色的点。返回 (更新点数, 备注)。"""
+    """把模型状态写到匹配角色的点；group_key 限定只写某一组。"""
     formats = formats or {}
     updated = 0
     notes: list[str] = []
 
     for group in device.groups.values():
+        if group_key is not None and group.key != group_key:
+            continue
         for point in group.points:
             role = role_for_point(point)
             if role is None:
