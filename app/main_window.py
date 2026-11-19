@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -28,6 +27,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
         self._last_tx_ms = 0
         self._updating = False
         self._current_group: Group | None = None
+        self._row_specs: list[tuple] = []
         self._rx_count = 0
         self._tx_count = 0
 
@@ -188,9 +189,13 @@ class MainWindow(QMainWindow):
         self.xml_summary.setWordWrap(True)
         self.xml_summary.setStyleSheet("color: #555;")
         left_layout.addWidget(self.xml_summary)
+        self.xml_warnings = QLabel("")
+        self.xml_warnings.setWordWrap(True)
+        self.xml_warnings.setStyleSheet("color: #b35c00;")
+        left_layout.addWidget(self.xml_warnings)
         left_layout.addWidget(self.group_list)
 
-        # 右侧：点表 + 数据区 + 预览
+        # 右侧：点表
         self.group_title = QLabel("未选择组")
         font = self.group_title.font()
         font.setBold(True)
@@ -202,7 +207,7 @@ class MainWindow(QMainWindow):
         info_row.addWidget(self.group_info)
         info_row.addStretch(1)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 8)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(
@@ -215,56 +220,60 @@ class MainWindow(QMainWindow):
         )
         self.table.horizontalHeader().setStretchLastSection(True)
 
-        hex_group = QGroupBox("数据区 HEX（可编辑，扩展字段直接改这里）")
-        hex_layout = QHBoxLayout(hex_group)
-        self.hex_edit = QLineEdit()
-        self.hex_edit.setFont(QFont("Consolas", 10))
-        self.apply_hex_btn = QPushButton("应用")
-        hex_layout.addWidget(self.hex_edit, 1)
-        hex_layout.addWidget(self.apply_hex_btn)
-
-        preview_group = QGroupBox("响应预览")
-        preview_layout = QVBoxLayout(preview_group)
-        self.preview = QPlainTextEdit()
-        self.preview.setReadOnly(True)
-        self.preview.setFont(QFont("Consolas", 10))
-        self.preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.preview.setMaximumHeight(104)
-        preview_layout.addWidget(self.preview)
-
         detail = QWidget()
         detail_layout = QVBoxLayout(detail)
         detail_layout.setContentsMargins(0, 0, 0, 0)
         detail_layout.addWidget(self.group_title)
         detail_layout.addLayout(info_row)
         detail_layout.addWidget(self.table, 1)
-        detail_layout.addWidget(hex_group)
-        detail_layout.addWidget(preview_group)
 
-        # 报文监视
-        log_widget = QWidget()
-        log_layout = QVBoxLayout(log_widget)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_header = QHBoxLayout()
-        log_header.addWidget(QLabel("报文监视"))
-        log_header.addStretch(1)
-        self.autoscroll_cb = QCheckBox("自动滚动")
-        self.autoscroll_cb.setChecked(True)
-        self.clear_log_btn = QPushButton("清空")
-        log_header.addWidget(self.autoscroll_cb)
-        log_header.addWidget(self.clear_log_btn)
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFont("Consolas", 9))
-        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.log_view.document().setMaximumBlockCount(5000)
-        log_layout.addLayout(log_header)
-        log_layout.addWidget(self.log_view)
+        # 底部：报文监视 / 运行日志 分开
+        self.bottom_tabs = QTabWidget()
+
+        frame_widget = QWidget()
+        frame_layout = QVBoxLayout(frame_widget)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_header = QHBoxLayout()
+        frame_header.addWidget(QLabel("RX / TX / ERR / ECHO"))
+        frame_header.addStretch(1)
+        self.frame_autoscroll_cb = QCheckBox("自动滚动")
+        self.frame_autoscroll_cb.setChecked(True)
+        self.clear_frame_btn = QPushButton("清空")
+        frame_header.addWidget(self.frame_autoscroll_cb)
+        frame_header.addWidget(self.clear_frame_btn)
+        self.frame_view = QPlainTextEdit()
+        self.frame_view.setReadOnly(True)
+        self.frame_view.setFont(QFont("Consolas", 9))
+        self.frame_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.frame_view.document().setMaximumBlockCount(5000)
+        frame_layout.addLayout(frame_header)
+        frame_layout.addWidget(self.frame_view)
+        self.bottom_tabs.addTab(frame_widget, "报文监视")
+
+        event_widget = QWidget()
+        event_layout = QVBoxLayout(event_widget)
+        event_layout.setContentsMargins(0, 0, 0, 0)
+        event_header = QHBoxLayout()
+        event_header.addWidget(QLabel("INFO / WARN / FAULT / REC / SKIP"))
+        event_header.addStretch(1)
+        self.event_autoscroll_cb = QCheckBox("自动滚动")
+        self.event_autoscroll_cb.setChecked(True)
+        self.clear_event_btn = QPushButton("清空")
+        event_header.addWidget(self.event_autoscroll_cb)
+        event_header.addWidget(self.clear_event_btn)
+        self.event_view = QPlainTextEdit()
+        self.event_view.setReadOnly(True)
+        self.event_view.setFont(QFont("Consolas", 9))
+        self.event_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.event_view.document().setMaximumBlockCount(5000)
+        event_layout.addLayout(event_header)
+        event_layout.addWidget(self.event_view)
+        self.bottom_tabs.addTab(event_widget, "运行日志")
 
         right = QSplitter(Qt.Orientation.Vertical)
         right.addWidget(detail)
-        right.addWidget(log_widget)
-        right.setSizes([540, 240])
+        right.addWidget(self.bottom_tabs)
+        right.setSizes([560, 220])
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left)
@@ -292,8 +301,8 @@ class MainWindow(QMainWindow):
         self.addr_spin.valueChanged.connect(self._update_status)
         self.group_list.currentItemChanged.connect(self._on_group_selected)
         self.table.itemChanged.connect(self._on_item_changed)
-        self.apply_hex_btn.clicked.connect(self._apply_hex)
-        self.clear_log_btn.clicked.connect(self.log_view.clear)
+        self.clear_frame_btn.clicked.connect(self.frame_view.clear)
+        self.clear_event_btn.clicked.connect(self.event_view.clear)
         self.fault_clear_btn.clicked.connect(self._clear_faults)
         self.template_btn.clicked.connect(self._open_templates)
         self.clear_record_btn.clicked.connect(self._clear_recorded)
@@ -407,16 +416,16 @@ class MainWindow(QMainWindow):
 
     def _handle_frame(self, frame: Frame) -> None:
         if not frame.valid:
-            self._log("ERR", f"{frame.error} | {frame.raw.hex(' ').upper()}")
+            self._log_frame("ERR", f"{frame.error} | {frame.raw.hex(' ').upper()}")
             return
 
         self._rx_count += 1
         self._update_counts()
-        self._log("RX", frame.summary())
+        self._log_frame("RX", frame.summary())
 
         now = QDateTime.currentMSecsSinceEpoch()
         if frame.raw == self._last_tx and (now - self._last_tx_ms) < 300:
-            self._log("ECHO", "忽略本机发送的回声")
+            self._log_frame("ECHO", "忽略本机发送的回声")
             return
 
         if frame.addr != self.addr_spin.value():
@@ -497,7 +506,7 @@ class MainWindow(QMainWindow):
         self._tx_count += 1
         self._update_counts()
         tx_frame = Frame(data, data[3], data[4], data[5], data[6:-1])
-        self._log("TX", tx_frame.summary())
+        self._log_frame("TX", tx_frame.summary())
         self._last_tx = data
         self._last_tx_ms = QDateTime.currentMSecsSinceEpoch()
 
@@ -596,6 +605,7 @@ class MainWindow(QMainWindow):
             self._refresh_group_list()
             self.xml_summary.setText("XML 加载失败")
             self.xml_summary.setToolTip(path)
+            self.xml_warnings.setText("⚠ XML 加载失败")
             self._log("ERR", f"XML 加载失败: {exc}")
             QMessageBox.critical(self, "XML 加载失败", f"{path}\n\n{exc}")
             return
@@ -625,6 +635,7 @@ class MainWindow(QMainWindow):
                 warnings.append("没有定值点（FixValDefine/SetPointDefine 为空）")
         for warning in warnings:
             self._log("WARN", warning)
+        self.xml_warnings.setText("⚠ " + "；".join(warnings) if warnings else "")
 
     def _refresh_group_list(self) -> None:
         self.group_list.blockSignals(True)
@@ -688,11 +699,11 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self.table.blockSignals(False)
-        self.hex_edit.clear()
-        self.preview.clear()
+        self._row_specs = []
 
     def _populate_group(self, group: Group) -> None:
         self._current_group = group
+        self._row_specs = []
         self.table.blockSignals(True)
         self.table.clear()
         self.table.clearSpans()
@@ -704,8 +715,6 @@ class MainWindow(QMainWindow):
         self.group_info.setText(
             f"数据区 {len(group.data)} 字节 | XML 点 {len(group.points)} 个"
         )
-        self.hex_edit.setText(format_hex(bytes(group.data)))
-        self.hex_edit.setCursorPosition(0)
 
         if group.kind == "YK":
             self._populate_yk(group)
@@ -715,7 +724,6 @@ class MainWindow(QMainWindow):
             self._populate_numeric(group)
 
         self.table.blockSignals(False)
-        self._update_preview()
 
     def _populate_numeric(self, group: Group) -> None:
         headers = [
@@ -730,15 +738,19 @@ class MainWindow(QMainWindow):
         ]
         self._style_table(headers)
         points = group.points
-        self.table.setRowCount(max(1, len(points)))
+        gaps = self._unmapped_ranges(group)
+        row_count = len(points) + len(gaps)
+        self.table.setRowCount(max(1, row_count))
+        self._row_specs = []
 
-        if not points:
-            item = self._make_item("无 XML 点定义，请直接编辑下方数据区 HEX")
+        if row_count == 0:
+            item = self._make_item("该组没有数据区")
             self.table.setItem(0, 0, item)
             self.table.setSpan(0, 0, 1, len(headers))
             return
 
         for row, point in enumerate(points):
+            self._row_specs.append(("point", point))
             if point.kind == "YX":
                 byte_value = group.data[point.fun] if point.fun < len(group.data) else 0
                 bit_value = (
@@ -757,10 +769,15 @@ class MainWindow(QMainWindow):
             raw = self._read_raw(group, point)
             raw_hex = format_hex(group.data[point.fun : point.fun + point.inf])
             factor = point.factor
-            engineering = f"{raw * factor:g}"
-            note = point.ied_dot
+            show_decimal = 0 < point.inf <= 4
+            raw_dec = str(raw) if show_decimal else "-"
+            engineering = f"{raw * factor:g}" if show_decimal else "-"
+            note_parts = []
+            if point.ied_dot:
+                note_parts.append(f"ID={point.ied_dot}")
             if point.kind == "FIX" and point.value_type:
-                note = (note + " | " if note else "") + f"ValueType={point.value_type}"
+                note_parts.append(f"ValueType={point.value_type}")
+            note = " | ".join(note_parts)
 
             self.table.setItem(row, 0, self._make_item(point.name or "(未命名)"))
             self.table.setItem(row, 1, self._make_item(str(point.fun)))
@@ -768,22 +785,27 @@ class MainWindow(QMainWindow):
             self.table.setItem(
                 row, 3, self._make_item(raw_hex, editable=point.inf > 0)
             )
-            self.table.setItem(row, 4, self._make_item(str(raw), editable=point.inf > 0))
+            self.table.setItem(row, 4, self._make_item(raw_dec, editable=show_decimal))
             self.table.setItem(
                 row,
                 5,
                 self._make_item(f"{factor:g}", editable=point.kind == "FIX"),
             )
             self.table.setItem(
-                row, 6, self._make_item(engineering, editable=point.inf > 0)
+                row, 6, self._make_item(engineering, editable=show_decimal)
             )
             self.table.setItem(row, 7, self._make_item(note))
+
+        for offset, (start, length) in enumerate(gaps, start=len(points)):
+            self._row_specs.append(("ext", (start, length)))
+            self._populate_extension_row(group, offset, start, length)
 
     def _populate_yx(self, group: Group) -> None:
         headers = ["名称", "字节", "位", "值", "说明"]
         self._style_table(headers)
         points = group.points
         self.table.setRowCount(max(1, len(points)))
+        self._row_specs = []
 
         if not points:
             self.table.setItem(0, 0, self._make_item("无 XML 点定义"))
@@ -791,6 +813,7 @@ class MainWindow(QMainWindow):
             return
 
         for row, point in enumerate(points):
+            self._row_specs.append(("point", point))
             byte_value = group.data[point.fun] if point.fun < len(group.data) else 0
             checked = (
                 bool((byte_value >> point.inf) & 0x01)
@@ -811,13 +834,18 @@ class MainWindow(QMainWindow):
                 Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
             )
             self.table.setItem(row, 3, item)
-            self.table.setItem(row, 4, self._make_item(point.ied_dot))
+            self.table.setItem(
+                row,
+                4,
+                self._make_item(f"ID={point.ied_dot}" if point.ied_dot else ""),
+            )
 
     def _populate_yk(self, group: Group) -> None:
         headers = ["名称", "功能码", "子类型", "应答结果", "说明"]
         self._style_table(headers)
         points = group.points
         self.table.setRowCount(max(1, len(points)))
+        self._row_specs = []
 
         if not points:
             self.table.setItem(0, 0, self._make_item("未定义控制"))
@@ -827,11 +855,16 @@ class MainWindow(QMainWindow):
             return
 
         for row, point in enumerate(points):
+            self._row_specs.append(("point", point))
             self.table.setItem(row, 0, self._make_item(point.name))
             self.table.setItem(row, 1, self._make_item(f"0x{group.group_no:02X}"))
             self.table.setItem(row, 2, self._make_item(f"0x{group.entry_no:02X}"))
             self._add_result_combo(row, group)
-            self.table.setItem(row, 4, self._make_item(point.ied_dot))
+            self.table.setItem(
+                row,
+                4,
+                self._make_item(f"ID={point.ied_dot}" if point.ied_dot else ""),
+            )
 
     def _add_result_combo(self, row: int, group: Group) -> None:
         combo = QComboBox()
@@ -853,7 +886,6 @@ class MainWindow(QMainWindow):
             group.data = bytearray((group.result,))
         else:
             group.data[0] = group.result
-        self._update_preview()
 
     # ----------------------------------------------------------- value edits
 
@@ -911,24 +943,55 @@ class MainWindow(QMainWindow):
         group = self._current_group
         row = item.row()
         column = item.column()
+        if row < 0 or row >= len(self._row_specs):
+            return
+        spec = self._row_specs[row]
 
         if group.kind == "YK":
             return
 
         if group.kind == "YX":
-            if column != 3 or row >= len(group.points):
+            if column != 3 or spec[0] != "point":
                 return
-            point = group.points[row]
+            point = spec[1]
             self._write_bit(
                 group, point, item.checkState() == Qt.CheckState.Checked
             )
-            self._update_hex_edit()
-            self._update_preview()
             return
 
-        if row >= len(group.points):
+        if spec[0] == "ext":
+            start, length = spec[1]
+            if column == 3:
+                try:
+                    data = parse_hex(item.text())
+                except ValueError:
+                    self._log("ERR", f"HEX 格式错误: {item.text()}")
+                    self._refresh_extension_row(group, row, start, length)
+                    return
+                if len(data) != length:
+                    self._log("ERR", f"扩展字段长度应为 {length} 字节")
+                    self._refresh_extension_row(group, row, start, length)
+                    return
+                raw = int.from_bytes(data, "big") if data else 0
+                if not self._write_range(group, start, length, raw):
+                    self._refresh_extension_row(group, row, start, length)
+                    return
+            elif column == 4:
+                try:
+                    raw = int(item.text().strip(), 0)
+                except ValueError:
+                    self._log("ERR", f"原始值必须是整数: {item.text()}")
+                    self._refresh_extension_row(group, row, start, length)
+                    return
+                if not self._write_range(group, start, length, raw):
+                    self._refresh_extension_row(group, row, start, length)
+                    return
+            else:
+                return
+            self._refresh_extension_row(group, row, start, length)
             return
-        point = group.points[row]
+
+        point = spec[1]
         if point.kind == "YX":
             return
 
@@ -970,7 +1033,6 @@ class MainWindow(QMainWindow):
                 return
             point.factor = value
             self._refresh_numeric_row(group, point, row)
-            self._update_preview()
             return
         elif column == 6:
             try:
@@ -991,83 +1053,106 @@ class MainWindow(QMainWindow):
             return
 
         self._refresh_numeric_row(group, point, row)
-        self._update_hex_edit()
-        self._update_preview()
 
-    def _update_hex_edit(self) -> None:
-        if self._current_group is None:
-            self.hex_edit.clear()
-            return
-        self.hex_edit.setText(format_hex(bytes(self._current_group.data)))
-        self.hex_edit.setCursorPosition(0)
+    @staticmethod
+    def _unmapped_ranges(group: Group) -> list[tuple[int, int]]:
+        """找出数据区里没有被 XML 点覆盖的连续区间。"""
+        total = len(group.data)
+        if total <= 0:
+            return []
 
-    def _apply_hex(self) -> None:
-        group = self._current_group
-        if group is None:
-            return
-        try:
-            data = parse_hex(self.hex_edit.text())
-        except ValueError:
-            QMessageBox.warning(self, "HEX 错误", "数据区 HEX 格式不正确")
-            return
+        intervals: list[tuple[int, int]] = []
+        for point in group.points:
+            if point.kind in ("YC", "FIX") and point.inf > 0:
+                start = max(0, min(point.fun, total))
+                end = max(start, min(point.fun + point.inf, total))
+                if end > start:
+                    intervals.append((start, end))
+            elif point.kind == "YX" and 0 <= point.fun < total:
+                intervals.append((point.fun, point.fun + 1))
 
-        if group.kind == "YK":
-            if not data:
-                data = bytes((group.result,))
-            if data[0] in (0x01, 0x81):
-                group.result = data[0]
-        else:
-            minimum = DeviceModel.xml_end(group)
-            if len(data) < minimum:
-                data += b"\x00" * (minimum - len(data))
+        if not intervals:
+            return [(0, total)]
 
-        group.data = bytearray(data)
-        if group.kind == "YK" and group.data:
-            group.data[0] = group.result
-        self._populate_group(group)
-        self._log("INFO", f"手动更新数据区: {len(group.data)} 字节")
-
-    # --------------------------------------------------------------- preview
-
-    def _update_preview(self) -> None:
-        group = self._current_group
-        if group is None:
-            self.preview.clear()
-            return
-
-        addr = self.addr_spin.value()
-        if group.kind == "YK":
-            if group.group_no == 0x02:
-                func = 0x82
-            elif group.group_no == 0x1A:
-                func = 0x1A
+        intervals.sort()
+        merged: list[list[int]] = []
+        for start, end in intervals:
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
             else:
-                func = group.group_no | 0x80
-            data = bytes((group.result,))
-            label = f"0x{func:02X}/{group.entry_no:02X} 控制应答"
-        elif group.group_no == 0x1B:
-            func = 0x1B
-            data = bytes(group.data)
-            label = "0x1B 定值读应答"
-        elif group.group_no == 0x01:
-            func = 0x81
-            data = bytes(group.data)
-            label = "0x81 查询应答"
-        else:
-            func = group.group_no | 0x80
-            data = bytes(group.data)
-            label = f"0x{func:02X} 应答"
+                merged[-1][1] = max(merged[-1][1], end)
 
-        try:
-            frame = FrameCodec.build(addr, func, group.entry_no, data)
-        except ValueError as exc:
-            self.preview.setPlainText(str(exc))
-            return
+        gaps: list[tuple[int, int]] = []
+        cursor = 0
+        for start, end in merged:
+            if cursor < start:
+                gaps.append((cursor, start - cursor))
+            cursor = max(cursor, end)
+        if cursor < total:
+            gaps.append((cursor, total - cursor))
+        return gaps
 
-        self.preview.setPlainText(
-            f"{label}\n{format_hex(frame)}\n"
-            f"数据区 {len(data)} 字节  校验 0x{frame[-1]:02X}"
+    def _populate_extension_row(
+        self, group: Group, row: int, start: int, length: int
+    ) -> None:
+        raw = self._read_range(group, start, length)
+        raw_hex = format_hex(group.data[start : start + length])
+        show_decimal = 0 < length <= 4
+        raw_dec = str(raw) if show_decimal else "-"
+        name = "原始数据" if not group.points else "扩展字段"
+        self.table.setItem(
+            row,
+            0,
+            self._make_item(f"{name} [{start}..{start + length - 1}]"),
         )
+        self.table.setItem(row, 1, self._make_item(str(start)))
+        self.table.setItem(row, 2, self._make_item(str(length)))
+        self.table.setItem(row, 3, self._make_item(raw_hex, editable=True))
+        self.table.setItem(row, 4, self._make_item(raw_dec, editable=show_decimal))
+        self.table.setItem(row, 5, self._make_item("1"))
+        self.table.setItem(row, 6, self._make_item(raw_dec))
+        self.table.setItem(row, 7, self._make_item("未映射字节，直接改原始值"))
+
+    def _refresh_extension_row(
+        self, group: Group, row: int, start: int, length: int
+    ) -> None:
+        self._updating = True
+        self.table.blockSignals(True)
+        try:
+            raw = self._read_range(group, start, length)
+            show_decimal = 0 < length <= 4
+            raw_dec = str(raw) if show_decimal else "-"
+            self.table.item(row, 3).setText(
+                format_hex(group.data[start : start + length])
+            )
+            self.table.item(row, 4).setText(raw_dec)
+            self.table.item(row, 6).setText(raw_dec)
+        finally:
+            self.table.blockSignals(False)
+            self._updating = False
+
+    def _read_range(self, group: Group, start: int, length: int) -> int:
+        if length <= 0:
+            return 0
+        end = start + length
+        if end > len(group.data):
+            group.data.extend(b"\x00" * (end - len(group.data)))
+        return int.from_bytes(group.data[start:end], "big")
+
+    def _write_range(
+        self, group: Group, start: int, length: int, raw: int
+    ) -> bool:
+        if length <= 0:
+            return False
+        max_raw = (1 << (8 * length)) - 1
+        if raw < 0 or raw > max_raw:
+            self._log("ERR", f"扩展字段超出范围 0..{max_raw}")
+            return False
+        end = start + length
+        if end > len(group.data):
+            group.data.extend(b"\x00" * (end - len(group.data)))
+        group.data[start:end] = int(raw).to_bytes(length, "big")
+        return True
 
     def _reset_data(self) -> None:
         if not self.device.groups:
@@ -1093,10 +1178,22 @@ class MainWindow(QMainWindow):
         self.count_label.setText(f"RX {self._rx_count} / TX {self._tx_count}")
 
     def _log(self, tag: str, text: str) -> None:
+        self._append_log(self.event_view, self.event_autoscroll_cb, tag, text)
+
+    def _log_frame(self, tag: str, text: str) -> None:
+        self._append_log(self.frame_view, self.frame_autoscroll_cb, tag, text)
+
+    @staticmethod
+    def _append_log(
+        view: QPlainTextEdit,
+        autoscroll: QCheckBox,
+        tag: str,
+        text: str,
+    ) -> None:
         timestamp = QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
-        self.log_view.appendPlainText(f"[{timestamp}] {tag:<5} {text}")
-        if self.autoscroll_cb.isChecked():
-            bar = self.log_view.verticalScrollBar()
+        view.appendPlainText(f"[{timestamp}] {tag:<5} {text}")
+        if autoscroll.isChecked():
+            bar = view.verticalScrollBar()
             bar.setValue(bar.maximum())
 
     def closeEvent(self, event) -> None:
