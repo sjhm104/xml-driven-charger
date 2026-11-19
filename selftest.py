@@ -7,11 +7,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 
 from app.device_model import DeviceModel, format_hex, parse_hex
+from app.fault_injector import FaultConfig, FaultInjector
 from app.frame_codec import FrameCodec
 from app.protocol_engine import ProtocolEngine
-from app.template_store import load_templates
+from app.template_store import (
+    load_templates,
+    save_templates,
+    template_key_for_frame,
+)
 
 XML_PATH = Path(r"E:\充电机\充电机参考装置类型表\DMP2219_Pow_CQ1000WTJND.xml")
 FIX_XML_PATH = Path(
@@ -154,6 +160,122 @@ def main() -> int:
         )
     else:
         print(f"  SKIP 未找到 {FIX_XML_PATH}")
+
+    print("== 故障注入 ==")
+    base = parse_hex(REAL_READ_FRAMES[0])
+    injector = FaultInjector()
+    result = injector.apply(base, FaultConfig(), 1)
+    check(
+        result.data == base and result.delay_ms == 0 and not result.notes,
+        "正常响应不变",
+    )
+    result = injector.apply(base, FaultConfig(drop_all=True), 1)
+    check(result.data is None, "不回帧")
+    injector.reset()
+    first = injector.apply(base, FaultConfig(drop_every_n=2), 1)
+    second = injector.apply(base, FaultConfig(drop_every_n=2), 1)
+    check(first.data is not None and second.data is None, "每 2 帧丢 1 帧")
+    result = injector.apply(base, FaultConfig(bad_checksum=True), 1)
+    check(
+        result.data is not None and result.data[-1] == (base[-1] ^ 0xFF),
+        "错校验",
+    )
+    result = injector.apply(base, FaultConfig(wrong_address=True), 1)
+    check(
+        result.data is not None
+        and result.data[3] == 2
+        and (sum(result.data[:-1]) & 0xFF) == result.data[-1],
+        "错地址且校验有效",
+    )
+    result = injector.apply(base, FaultConfig(short_frame=True), 1)
+    check(
+        result.data is not None and len(result.data) == len(base) - 1,
+        "短帧少 1 字节",
+    )
+    result = injector.apply(base, FaultConfig(delay_ms=200), 1)
+    check(result.delay_ms == 200, "延迟参数")
+
+    print("== 模板键/存储 ==")
+    check(DeviceModel.parse_group_key("27/1") == (0x1B, 0x01), "27/1 按十进制解析")
+    check(
+        DeviceModel.parse_group_key("1B/01") == (0x1B, 0x01),
+        "1B/01 按十六进制解析",
+    )
+    check(
+        DeviceModel.parse_group_key("0x1B/0x01") == (0x1B, 0x01),
+        "0x1B/0x01 按十六进制解析",
+    )
+    response_frame = FrameCodec.extract(
+        bytearray(parse_hex(REAL_READ_FRAMES[0]))
+    )[0]
+    check(template_key_for_frame(response_frame) == "0x1B01", "0x1B 响应映射为 0x1B01")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        template_path = Path(temp_dir) / "templates.json"
+        save_templates(
+            template_path,
+            {"0x1B02": "00 5A 08 66", "0x1B01": "00 18 12 5C"},
+        )
+        check(
+            load_templates(template_path)
+            == {"0x1B01": "00 18 12 5C", "0x1B02": "00 5A 08 66"},
+            "模板保存/加载",
+        )
+        template_path.write_text("{}", encoding="utf-8")
+        check(load_templates(template_path) == {}, "空模板文件返回空字典")
+
+    print("== 多组定值读写 ==")
+    multi_xml = """<?xml version="1.0" encoding="GB2312"?>
+<IEDDefine>
+<FixValDefine Count="4">
+<FixValDefine0 Id="0" GroupNo="27" EntryNo="1" FUN="0" INF="2" Name="电池容量" ValueType="4" Enable="1"/>
+<FixValDefine1 Id="1" GroupNo="27" EntryNo="1" FUN="2" INF="2" Name="截止电压" ValueType="6" Enable="1"/>
+<FixValDefine2 Id="2" GroupNo="27" EntryNo="2" FUN="0" INF="2" Name="周期" ValueType="4" Enable="1"/>
+<FixValDefine3 Id="3" GroupNo="27" EntryNo="2" FUN="2" INF="2" Name="剩余" ValueType="4" Enable="1"/>
+</FixValDefine>
+</IEDDefine>
+"""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        multi_path = Path(temp_dir) / "multi.xml"
+        multi_path.write_text(multi_xml, encoding="gb18030")
+        multi_device = DeviceModel()
+        multi_device.load_xml(multi_path)
+        check(len(multi_device.groups) == 2, "合成 XML 有 2 个定值组")
+        multi_device.apply_templates(
+            {"0x1B01": "00 18 12 5C", "0x1B02": "00 5A 08 66"}
+        )
+        multi_engine = ProtocolEngine(multi_device)
+
+        read_1 = FrameCodec.build(1, 0x1B, 0x01)
+        read_2 = FrameCodec.build(1, 0x1B, 0x02)
+        response_1 = multi_engine.handle(FrameCodec.extract(bytearray(read_1))[0])
+        response_2 = multi_engine.handle(FrameCodec.extract(bytearray(read_2))[0])
+        check(
+            response_1
+            == FrameCodec.build(1, 0x1B, 0x01, parse_hex("00 18 12 5C")),
+            "0x1B01 读响应",
+        )
+        check(
+            response_2
+            == FrameCodec.build(1, 0x1B, 0x02, parse_hex("00 5A 08 66")),
+            "0x1B02 读响应",
+        )
+
+        write_1 = FrameCodec.build(1, 0x1A, 0x01, parse_hex("00 1E 12 C0"))
+        write_2 = FrameCodec.build(1, 0x1A, 0x02, parse_hex("00 3C 00 64"))
+        response_1 = multi_engine.handle(FrameCodec.extract(bytearray(write_1))[0])
+        response_2 = multi_engine.handle(FrameCodec.extract(bytearray(write_2))[0])
+        check(response_1 == write_1, "0x1A01 写入回显")
+        check(response_2 == write_2, "0x1A02 写入回显")
+        check(
+            format_hex(bytes(multi_device.find(0x1B, 0x01).data))
+            == "00 1E 12 C0",
+            "0x1A01 写入后组数据更新",
+        )
+        check(
+            format_hex(bytes(multi_device.find(0x1B, 0x02).data))
+            == "00 3C 00 64",
+            "0x1A02 写入后组数据更新",
+        )
 
     print("\nALL TESTS PASSED")
     return 0

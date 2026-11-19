@@ -229,14 +229,25 @@ class DeviceModel:
 
     @staticmethod
     def parse_group_key(text: str) -> tuple[int, int]:
-        """支持 "0x1B01"、"1B01"、"27/1"、"0x1B,0x01"。"""
-        s = text.strip().lower().replace("0x", "")
-        if "/" in s:
-            a, b = s.split("/", 1)
-            return int(a, 16), int(b, 16)
-        if "," in s or ":" in s:
-            a, b = re.split(r"[,:]", s, 1)
-            return int(a, 16), int(b, 16)
+        """支持 "0x1B01"、"1B01"、"27/1"（十进制）、"0x1B/0x01"（十六进制）。
+
+        斜杠/逗号形式：带 0x 或含 A-F 的部分按十六进制，否则按十进制。
+        """
+        s = text.strip().lower()
+        if "/" in s or "," in s or ":" in s:
+            parts = re.split(r"[/,:]", s)
+            if len(parts) != 2:
+                raise ValueError(f"组格式错误: {text}")
+
+            def base_of(part: str) -> int:
+                cleaned = part.strip().lower().replace("0x", "")
+                if part.strip().lower().startswith("0x"):
+                    return 16
+                return 16 if any(ch in "abcdef" for ch in cleaned) else 10
+
+            a, b = parts[0].strip(), parts[1].strip()
+            return int(a, base_of(a)), int(b, base_of(b))
+        s = s.replace("0x", "")
         value = int(s, 16)
         return (value >> 8) & 0xFF, value & 0xFF
 

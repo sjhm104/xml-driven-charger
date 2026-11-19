@@ -48,4 +48,37 @@ def load_templates(path: str | Path) -> dict[str, str]:
         if key.startswith("_"):
             continue
         result[key] = str(value)
-    return result or dict(DEFAULT_TEMPLATES)
+    return result
+
+
+def save_templates(path: str | Path, templates: dict[str, str]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = {key: templates[key] for key in sorted(templates)}
+    path.write_text(
+        json.dumps(ordered, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def template_key_for_frame(frame) -> str | None:
+    """从响应帧推导模板键。
+
+    0x81 -> 0x01xx（查询）
+    0x82 -> 0x02xx（控制）
+    0x1A/0x1B -> 0x1Bxx（定值数据组）
+    0x83 -> 0x03xx（均浮充，通常没有对应点表）
+    """
+    func = frame.func
+    subtype = frame.subtype
+    if func == 0x81:
+        group_no = 0x01
+    elif func == 0x82:
+        group_no = 0x02
+    elif func in (0x1A, 0x1B):
+        group_no = 0x1B
+    elif func == 0x83:
+        group_no = 0x03
+    else:
+        return None
+    return f"0x{group_no:02X}{subtype:02X}"

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDateTime, QSettings, QIODevice
+from PySide6.QtCore import Qt, QDateTime, QSettings, QIODevice, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -39,8 +40,10 @@ from app.device_model import (
     format_hex,
     parse_hex,
 )
+from app.fault_injector import FaultConfig, FaultInjector
 from app.frame_codec import Frame, FrameCodec
 from app.protocol_engine import ProtocolEngine
+from app.template_dialog import TemplateDialog
 from app.template_store import load_templates
 
 
@@ -56,6 +59,9 @@ class MainWindow(QMainWindow):
         self.templates = load_templates(self.templates_path)
         self.device = DeviceModel()
         self.engine = ProtocolEngine(self.device)
+        self.fault_injector = FaultInjector()
+        self.recorded_frames: list[Frame] = []
+        self._last_request: tuple[int, Frame] | None = None
 
         self.port = QSerialPort(self)
         self._rx_buffer = bytearray()
@@ -124,6 +130,52 @@ class MainWindow(QMainWindow):
         self.reset_btn = QPushButton("重置数据")
         top.addWidget(self.reset_btn)
         top.addStretch(1)
+
+        # 故障注入 + 模板
+        aux = QHBoxLayout()
+
+        fault_group = QGroupBox("故障注入")
+        fault_layout = QHBoxLayout(fault_group)
+        self.fault_drop_all_cb = QCheckBox("不回帧")
+        self.fault_delay_spin = QSpinBox()
+        self.fault_delay_spin.setRange(0, 5000)
+        self.fault_delay_spin.setSingleStep(50)
+        self.fault_delay_spin.setSuffix(" ms")
+        self.fault_delay_spin.setFixedWidth(90)
+        self.fault_delay_spin.setToolTip("每次响应延迟发送；超过 300ms 会触发 DTU 超时重发")
+        self.fault_bad_crc_cb = QCheckBox("错校验")
+        self.fault_wrong_addr_cb = QCheckBox("错地址+1")
+        self.fault_short_cb = QCheckBox("短帧")
+        self.fault_short_cb.setToolTip("少发最后 1 字节（校验和），DTU 会等超时")
+        self.fault_drop_every_spin = QSpinBox()
+        self.fault_drop_every_spin.setRange(0, 100)
+        self.fault_drop_every_spin.setFixedWidth(60)
+        self.fault_drop_every_spin.setToolTip("每 N 帧丢 1 帧，0=关闭")
+        self.fault_clear_btn = QPushButton("清除故障")
+        fault_layout.addWidget(self.fault_drop_all_cb)
+        fault_layout.addWidget(QLabel("延迟"))
+        fault_layout.addWidget(self.fault_delay_spin)
+        fault_layout.addWidget(self.fault_bad_crc_cb)
+        fault_layout.addWidget(self.fault_wrong_addr_cb)
+        fault_layout.addWidget(self.fault_short_cb)
+        fault_layout.addWidget(QLabel("丢帧 每"))
+        fault_layout.addWidget(self.fault_drop_every_spin)
+        fault_layout.addWidget(QLabel("帧丢1"))
+        fault_layout.addWidget(self.fault_clear_btn)
+        fault_layout.addStretch(1)
+
+        template_group = QGroupBox("模板")
+        template_layout = QHBoxLayout(template_group)
+        self.template_btn = QPushButton("模板...")
+        self.record_cb = QCheckBox("录制响应")
+        self.record_cb.setToolTip("取消自动应答后，勾选此项可监听并录制真实设备响应")
+        self.clear_record_btn = QPushButton("清空录制")
+        template_layout.addWidget(self.template_btn)
+        template_layout.addWidget(self.record_cb)
+        template_layout.addWidget(self.clear_record_btn)
+
+        aux.addWidget(fault_group, 1)
+        aux.addWidget(template_group)
 
         # 左侧组列表
         self.group_list = QListWidget()
@@ -222,6 +274,7 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root_layout = QVBoxLayout(root)
         root_layout.addLayout(top)
+        root_layout.addLayout(aux)
         root_layout.addWidget(splitter, 1)
         self.setCentralWidget(root)
 
@@ -241,6 +294,9 @@ class MainWindow(QMainWindow):
         self.table.itemChanged.connect(self._on_item_changed)
         self.apply_hex_btn.clicked.connect(self._apply_hex)
         self.clear_log_btn.clicked.connect(self.log_view.clear)
+        self.fault_clear_btn.clicked.connect(self._clear_faults)
+        self.template_btn.clicked.connect(self._open_templates)
+        self.clear_record_btn.clicked.connect(self._clear_recorded)
 
     # ------------------------------------------------------------- settings
 
@@ -367,8 +423,19 @@ class MainWindow(QMainWindow):
             self._log("SKIP", f"地址不匹配: {frame.addr} != {self.addr_spin.value()}")
             return
 
-        if frame.func not in (0x01, 0x02, 0x1A, 0x1B, 0x83, 0x03):
-            self._log("SKIP", f"非请求功能码 0x{frame.func:02X}")
+        request_funcs = (0x01, 0x02, 0x1A, 0x1B, 0x83, 0x03)
+        previous_request = self._last_request
+
+        if self._is_recordable_response(frame, now, previous_request):
+            self.recorded_frames.append(frame)
+            if len(self.recorded_frames) > 100:
+                self.recorded_frames.pop(0)
+            self._log("REC", frame.summary())
+            return
+
+        if frame.func in request_funcs:
+            self._last_request = (now, frame)
+        else:
             return
 
         if not self.auto_cb.isChecked() or self.pause_cb.isChecked():
@@ -388,20 +455,22 @@ class MainWindow(QMainWindow):
         if self.engine.last_note:
             self._log("INFO", self.engine.last_note)
 
-        written = self.port.write(response)
-        if written < 0:
-            self._log("ERR", f"发送失败: {self.port.errorString()}")
-            return
-        self.port.flush()
-
-        self._tx_count += 1
-        self._update_counts()
-        tx_frame = Frame(
-            response, response[3], response[4], response[5], response[6:-1]
+        fault = self.fault_injector.apply(
+            response, self._fault_config(), self.addr_spin.value()
         )
-        self._log("TX", tx_frame.summary())
-        self._last_tx = response
-        self._last_tx_ms = now
+        if fault.notes:
+            self._log("FAULT", "; ".join(fault.notes))
+        if fault.data is None:
+            return
+
+        if fault.delay_ms > 0:
+            self._log("INFO", f"{fault.delay_ms} ms 后发送响应")
+            QTimer.singleShot(
+                fault.delay_ms,
+                lambda data=fault.data: self._send_response(data),
+            )
+        else:
+            self._send_response(fault.data)
 
         if (
             self._current_group is not None
@@ -410,6 +479,100 @@ class MainWindow(QMainWindow):
             and self._current_group.key == (0x1B, frame.subtype)
         ):
             self._populate_group(self._current_group)
+
+    def _send_response(self, data: bytes) -> None:
+        if not self.port.isOpen():
+            self._log("ERR", "串口未打开，取消发送")
+            return
+        if len(data) < 6:
+            self._log("ERR", "响应长度异常，取消发送")
+            return
+
+        written = self.port.write(data)
+        if written < 0:
+            self._log("ERR", f"发送失败: {self.port.errorString()}")
+            return
+        self.port.flush()
+
+        self._tx_count += 1
+        self._update_counts()
+        tx_frame = Frame(data, data[3], data[4], data[5], data[6:-1])
+        self._log("TX", tx_frame.summary())
+        self._last_tx = data
+        self._last_tx_ms = QDateTime.currentMSecsSinceEpoch()
+
+    def _is_recordable_response(
+        self,
+        frame: Frame,
+        now: int,
+        previous_request: tuple[int, Frame] | None,
+    ) -> bool:
+        if not self.record_cb.isChecked():
+            return False
+        if frame.addr != self.addr_spin.value():
+            return False
+
+        # 0x81/0x82 只可能是响应
+        if frame.func in (0x81, 0x82):
+            return True
+
+        # 0x1A/0x1B/0x83 请求和响应功能码相同，用“请求后 20~280ms、
+        # 同地址/功能码/子类型、有数据区”判断响应。
+        if frame.func in (0x1A, 0x1B, 0x83):
+            if not frame.data or previous_request is None:
+                return False
+            timestamp, request = previous_request
+            delta = now - timestamp
+            return (
+                20 <= delta <= 280
+                and request.addr == frame.addr
+                and request.func == frame.func
+                and request.subtype == frame.subtype
+            )
+        return False
+
+    def _fault_config(self) -> FaultConfig:
+        return FaultConfig(
+            drop_all=self.fault_drop_all_cb.isChecked(),
+            delay_ms=self.fault_delay_spin.value(),
+            bad_checksum=self.fault_bad_crc_cb.isChecked(),
+            wrong_address=self.fault_wrong_addr_cb.isChecked(),
+            short_frame=self.fault_short_cb.isChecked(),
+            drop_every_n=self.fault_drop_every_spin.value(),
+        )
+
+    def _clear_faults(self) -> None:
+        self.fault_drop_all_cb.setChecked(False)
+        self.fault_delay_spin.setValue(0)
+        self.fault_bad_crc_cb.setChecked(False)
+        self.fault_wrong_addr_cb.setChecked(False)
+        self.fault_short_cb.setChecked(False)
+        self.fault_drop_every_spin.setValue(0)
+        self.fault_injector.reset()
+        self._log("INFO", "故障注入已清除")
+
+    def _clear_recorded(self) -> None:
+        self.recorded_frames.clear()
+        self._log("INFO", "录制缓存已清空")
+
+    def _open_templates(self) -> None:
+        dialog = TemplateDialog(
+            self,
+            self.templates,
+            self._current_group,
+            self.recorded_frames,
+            self.templates_path,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self.templates = dict(dialog.templates)
+        if dialog.apply_now:
+            self.device.reset_defaults(self.templates)
+            self._refresh_group_list()
+            self._log("INFO", "模板已保存并应用（所有组已按模板重置）")
+        else:
+            self._log("INFO", "模板已保存（下次加载 XML 时生效）")
 
     # ------------------------------------------------------------------ xml
 
