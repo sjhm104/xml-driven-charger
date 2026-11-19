@@ -21,6 +21,7 @@ preview_*.png
 
 # 本机点格式/预设/导出
 data/point_formats.json
+data/battery_config.json
 data/preset*.json
 data/frames*.csv
 data/events*.txt

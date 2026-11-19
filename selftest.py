@@ -11,9 +11,12 @@ import struct
 import tempfile
 
 from app.battery_model import (
+    BatteryConfig,
     BatteryModel,
     apply_snapshot,
+    load_battery_config,
     role_for_point,
+    save_battery_config,
 )
 from app.device_model import DeviceModel, Point, format_hex, parse_hex
 from app.fault_injector import FaultConfig, FaultInjector
@@ -327,6 +330,31 @@ def main() -> int:
         snapshot["activation"] and 9.0 < model.max_discharge_minutes < 11.0,
         "活化放电 10 分钟",
     )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        config_path = Path(temp_dir) / "battery_config.json"
+        custom = BatteryConfig(
+            capacity_ah=40.0,
+            initial_soc=80.0,
+            float_voltage=54.0,
+            charge_voltage=58.0,
+            empty_voltage=43.0,
+            undervoltage=47.0,
+            cutoff=44.0,
+        )
+        save_battery_config(config_path, custom)
+        loaded = load_battery_config(config_path)
+        check(
+            loaded.capacity_ah == 40.0
+            and loaded.initial_soc == 80.0
+            and loaded.undervoltage == 47.0,
+            "电池参数保存/加载",
+        )
+        config_path.write_text("not json", encoding="utf-8")
+        check(
+            load_battery_config(config_path).capacity_ah == 24.0,
+            "坏参数文件回退默认",
+        )
 
     check(
         role_for_point(Point("YC", "电池电压", 1, 1, 0, 2))

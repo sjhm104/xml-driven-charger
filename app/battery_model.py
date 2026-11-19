@@ -6,7 +6,9 @@ apply_snapshot() 负责把状态写到 XML 点表对应的数据区。
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
+import json
+from pathlib import Path
 import struct
 
 from app.device_model import DeviceModel, Point, parse_hex
@@ -289,3 +291,38 @@ def set_snapshot_group_data(device: DeviceModel, data: dict[str, str]) -> int:
             group.result = payload[0]
         updated += 1
     return updated
+
+
+def load_battery_config(path: str | Path) -> BatteryConfig:
+    path = Path(path)
+    if not path.exists():
+        return BatteryConfig()
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return BatteryConfig()
+    if not isinstance(obj, dict):
+        return BatteryConfig()
+
+    allowed = {item.name for item in fields(BatteryConfig)}
+    kwargs: dict[str, float] = {}
+    for key, value in obj.items():
+        if key not in allowed:
+            continue
+        try:
+            kwargs[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    try:
+        return BatteryConfig(**kwargs)
+    except TypeError:
+        return BatteryConfig()
+
+
+def save_battery_config(path: str | Path, config: BatteryConfig) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(asdict(config), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )

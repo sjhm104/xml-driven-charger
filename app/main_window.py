@@ -36,7 +36,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.battery_model import BatteryModel, apply_snapshot
+from app.battery_model import (
+    BatteryModel,
+    apply_snapshot,
+    load_battery_config,
+    save_battery_config,
+)
+from app.battery_config_dialog import BatteryConfigDialog
 from app.device_model import (
     KIND_NAMES,
     DeviceModel,
@@ -79,7 +85,10 @@ class MainWindow(QMainWindow):
         self._last_request: tuple[int, Frame] | None = None
         self._frame_records: list[dict] = []
 
-        self.battery_model = BatteryModel()
+        self.battery_config_path = self.app_dir / "data" / "battery_config.json"
+        self.battery_model = BatteryModel(
+            load_battery_config(self.battery_config_path)
+        )
         self.battery_timer = QTimer(self)
         self.battery_timer.setInterval(1000)
         self.battery_timer.timeout.connect(self._on_battery_tick)
@@ -393,6 +402,8 @@ class MainWindow(QMainWindow):
         battery_row2.addWidget(self.battery_soc_label)
         battery_row2.addWidget(self.battery_voltage_label)
         battery_row2.addWidget(self.battery_state_label)
+        self.battery_config_btn = QPushButton("电池参数...")
+        battery_row2.addWidget(self.battery_config_btn)
         battery_row2.addStretch(1)
         battery_layout.addLayout(battery_row2)
 
@@ -472,6 +483,7 @@ class MainWindow(QMainWindow):
         self.battery_activation_btn.clicked.connect(self._start_activation)
         self.battery_activation_stop_btn.clicked.connect(self._stop_activation)
         self.battery_reset_btn.clicked.connect(self._reset_battery)
+        self.battery_config_btn.clicked.connect(self._edit_battery_config)
         self.battery_ac_cb.toggled.connect(self._on_battery_controls_changed)
         for checkbox in self.battery_phase_cbs:
             checkbox.toggled.connect(self._on_battery_controls_changed)
@@ -901,6 +913,33 @@ class MainWindow(QMainWindow):
         self._battery_last_alarms = {}
         self._battery_last_state = ""
         self._log("MODEL", "电池模型已重置")
+
+    def _edit_battery_config(self) -> None:
+        dialog = BatteryConfigDialog(self, self.battery_model.config)
+        if (
+            dialog.exec() != QDialog.DialogCode.Accepted
+            or dialog.result_config is None
+        ):
+            return
+
+        running = self.battery_timer.isActive()
+        self.battery_model.config = dialog.result_config
+        try:
+            save_battery_config(self.battery_config_path, dialog.result_config)
+        except OSError as exc:
+            self._log("ERR", f"保存电池参数失败: {exc}")
+
+        self.battery_model.reset()
+        self._apply_battery_ui_to_model()
+        self._apply_battery_snapshot()
+        self._update_battery_labels()
+        self._refresh_current_values()
+        self._battery_last_alarms = {}
+        self._battery_last_state = ""
+        self._log(
+            "MODEL",
+            "电池参数已更新" + ("，模型已重置" if running else ""),
+        )
 
     def _start_activation(self) -> None:
         self.battery_model.start_activation()
