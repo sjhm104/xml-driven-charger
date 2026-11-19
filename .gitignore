@@ -18,3 +18,9 @@ dist/
 # 临时文件
 *.log
 preview_*.png
+
+# 本机点格式/预设/导出
+data/point_formats.json
+data/preset*.json
+data/frames*.csv
+data/events*.txt

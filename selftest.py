@@ -7,17 +7,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 import tempfile
 
-from app.device_model import DeviceModel, format_hex, parse_hex
+from app.device_model import DeviceModel, Point, format_hex, parse_hex
 from app.fault_injector import FaultConfig, FaultInjector
 from app.frame_codec import FrameCodec
+from app.point_format import PointFormat
+from app.point_format_store import load_formats, point_key, save_formats
 from app.protocol_engine import ProtocolEngine
+from app.preset_store import apply_preset, collect_preset, load_preset, save_preset
 from app.template_store import (
     load_templates,
     save_templates,
     template_key_for_frame,
 )
+from app.xml_validator import validate_device
 
 XML_PATH = Path(r"E:\充电机\充电机参考装置类型表\DMP2219_Pow_CQ1000WTJND.xml")
 FIX_XML_PATH = Path(
@@ -222,6 +227,101 @@ def main() -> int:
         )
         template_path.write_text("{}", encoding="utf-8")
         check(load_templates(template_path) == {}, "空模板文件返回空字典")
+
+    print("== 预设 ==")
+    preset = collect_preset(device)
+    check("0x0101" in preset["values"], "预设包含 0x0101")
+    preset_group = device.find(0x01, 0x01)
+    assert preset_group is not None
+    original = bytes(preset_group.data)
+    preset_group.data[0] ^= 0xFF
+    applied, skipped, notes = apply_preset(device, preset)
+    check(applied > 0 and skipped == 0 and not notes, f"预设应用 {applied} 组")
+    check(bytes(preset_group.data) == original, "预设恢复 0x0101 数据区")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        preset_path = Path(temp_dir) / "preset.json"
+        save_preset(preset_path, device)
+        loaded = load_preset(preset_path)
+        check(
+            loaded["values"].get("0x0101") == preset["values"].get("0x0101"),
+            "预设保存/加载",
+        )
+
+    print("== 点格式 ==")
+    fmt = PointFormat("u16be")
+    check(fmt.decode_raw(parse_hex("12 5C")) == 4700, "u16be 解码")
+    check(fmt.encode_raw(4700, 2) == parse_hex("12 5C"), "u16be 编码")
+
+    fmt = PointFormat("i16be")
+    check(fmt.decode_raw(parse_hex("FF D8")) == -40, "i16be 解码负数")
+    check(fmt.encode_raw(-40, 2) == parse_hex("FF D8"), "i16be 编码负数")
+
+    fmt = PointFormat("u16be", offset=-40.0, scale=1.0)
+    check(fmt.decode_eng(parse_hex("00 00"), 1.0) == -40, "偏移解码")
+    check(fmt.encode_eng(0.0, 2, 1.0) == parse_hex("00 28"), "偏移编码")
+
+    fmt = PointFormat("f32be")
+    float_data = struct.pack(">f", 47.5)
+    check(abs(fmt.decode_eng(float_data, 1.0) - 47.5) < 1e-5, "float32 解码")
+    check(fmt.encode_eng(47.5, 4, 1.0) == float_data, "float32 编码")
+
+    fmt = PointFormat("auto")
+    check(fmt.decode_raw(parse_hex("12 5C")) == 4700, "auto 2 字节")
+    check(
+        fmt.decode_raw(parse_hex("00 00 00 00 00 00 00 64")) == 100,
+        "auto 8 字节按原始大端",
+    )
+
+    point = Point("YC", "温度", 1, 17, 0, 2)
+    key = point_key(point)
+    check(key == "1/17/0/2/YC", f"点键 = {key}")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        format_path = Path(temp_dir) / "point_formats.json"
+        save_formats(format_path, "DEMO", {key: PointFormat("i16be")})
+        loaded = load_formats(format_path, "DEMO")
+        check(loaded[key].code == "i16be", "点格式保存/加载")
+        other = Point("YC", "浮点", 1, 3, 0, 4)
+        save_formats(
+            format_path,
+            "OTHER",
+            {point_key(other): PointFormat("f32be")},
+        )
+        check(
+            load_formats(format_path, "DEMO")[key].code == "i16be"
+            and load_formats(format_path, "OTHER")[
+                point_key(other)
+            ].code
+            == "f32be",
+            "不同 XML 的点格式互不覆盖",
+        )
+
+    print("== XML 校验 ==")
+    bad_xml = """<?xml version="1.0" encoding="GB2312"?>
+<IEDDefine>
+<MeasureDefine Count="3">
+<MeasureDefine0 GroupNo="1" EntryNo="1" FUN="0" INF="2" Name="A" Factor="1" Enable="1"/>
+<MeasureDefine1 GroupNo="1" EntryNo="1" FUN="1" INF="2" Name="B重叠" Factor="1" Enable="1"/>
+<MeasureDefine2 GroupNo="1" EntryNo="1" FUN="300" INF="2" Name="C越界" Factor="1" Enable="1"/>
+</MeasureDefine>
+<SignalDefine Count="3">
+<SignalDefine0 GroupNo="1" EntryNo="2" FUN="0" INF="0" Name="X" Enable="1"/>
+<SignalDefine1 GroupNo="1" EntryNo="2" FUN="0" INF="0" Name="X重复" Enable="1"/>
+<SignalDefine2 GroupNo="1" EntryNo="2" FUN="0" INF="8" Name="Y坏位" Enable="1"/>
+</SignalDefine>
+</IEDDefine>
+"""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        bad_path = Path(temp_dir) / "bad.xml"
+        bad_path.write_text(bad_xml, encoding="gb18030")
+        bad_device = DeviceModel()
+        bad_device.load_xml(bad_path)
+        issues = validate_device(bad_device)
+        messages = [str(issue) for issue in issues]
+        check(len(messages) >= 4, f"发现问题 {len(messages)} 条")
+        check(any("数据区重叠" in m for m in messages), "识别数据区重叠")
+        check(any("同一字节/位" in m for m in messages), "识别遥信重复位")
+        check(any("不在 0..7" in m for m in messages), "识别遥信位号越界")
+        check(any("FUN=300" in m for m in messages), "识别 FUN 越界")
 
     print("== 多组定值读写 ==")
     multi_xml = """<?xml version="1.0" encoding="GB2312"?>

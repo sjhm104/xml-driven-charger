@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import struct
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QDateTime, QSettings, QIODevice, QTimer
@@ -17,6 +19,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -42,9 +45,15 @@ from app.device_model import (
 )
 from app.fault_injector import FaultConfig, FaultInjector
 from app.frame_codec import Frame, FrameCodec
+from app.point_format import PointFormat
+from app.point_format_dialog import PointFormatDialog
+from app.point_format_store import load_formats, point_key, save_formats
+from app.preset_store import apply_preset, load_preset, save_preset
 from app.protocol_engine import ProtocolEngine
 from app.template_dialog import TemplateDialog
 from app.template_store import load_templates
+from app.xml_check_dialog import XmlCheckDialog
+from app.xml_validator import validate_device
 
 
 class MainWindow(QMainWindow):
@@ -55,21 +64,35 @@ class MainWindow(QMainWindow):
 
         self.app_dir = Path(__file__).resolve().parent.parent
         self.templates_path = self.app_dir / "data" / "templates.json"
+        self.formats_path = self.app_dir / "data" / "point_formats.json"
         self.settings = QSettings("ChargerSim", "ChargerSim")
         self.templates = load_templates(self.templates_path)
+        self._formats: dict[str, PointFormat] = {}
+        self._xml_stem = ""
         self.device = DeviceModel()
         self.engine = ProtocolEngine(self.device)
         self.fault_injector = FaultInjector()
         self.recorded_frames: list[Frame] = []
         self._last_request: tuple[int, Frame] | None = None
+        self._frame_records: list[dict] = []
 
         self.port = QSerialPort(self)
+        self._want_open = False
+        self._desired_port = ""
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setInterval(2000)
+        self._reconnect_timer.timeout.connect(self._try_reconnect)
+        self._port_scan_timer = QTimer(self)
+        self._port_scan_timer.setInterval(2000)
+        self._port_scan_timer.timeout.connect(self._scan_ports)
         self._rx_buffer = bytearray()
         self._last_tx = b""
         self._last_tx_ms = 0
         self._updating = False
         self._current_group: Group | None = None
         self._row_specs: list[tuple] = []
+        self._xml_issues: list = []
+        self._xml_notes: list[str] = []
         self._rx_count = 0
         self._tx_count = 0
 
@@ -77,6 +100,7 @@ class MainWindow(QMainWindow):
         self._refresh_ports()
         self._load_settings()
         self._set_port_open(False)
+        self._port_scan_timer.start()
         self._update_counts()
         self._log("INFO", "工具启动。请选择串口并加载装置类型表 XML。")
 
@@ -109,6 +133,11 @@ class MainWindow(QMainWindow):
         self.open_btn = QPushButton("打开串口")
         self.open_btn.setMinimumWidth(96)
         top.addWidget(self.open_btn)
+
+        self.reconnect_cb = QCheckBox("自动重连")
+        self.reconnect_cb.setChecked(True)
+        self.reconnect_cb.setToolTip("串口异常断开后每 2 秒尝试重新打开")
+        top.addWidget(self.reconnect_cb)
 
         top.addSpacing(10)
         top.addWidget(QLabel("地址:"))
@@ -193,6 +222,8 @@ class MainWindow(QMainWindow):
         self.xml_warnings.setWordWrap(True)
         self.xml_warnings.setStyleSheet("color: #b35c00;")
         left_layout.addWidget(self.xml_warnings)
+        self.xml_check_btn = QPushButton("XML 检查...")
+        left_layout.addWidget(self.xml_check_btn)
         left_layout.addWidget(self.group_list)
 
         # 右侧：点表
@@ -206,6 +237,14 @@ class MainWindow(QMainWindow):
         info_row = QHBoxLayout()
         info_row.addWidget(self.group_info)
         info_row.addStretch(1)
+        self.format_btn = QPushButton("点格式...")
+        info_row.addWidget(self.format_btn)
+        info_row.addWidget(QLabel("搜索:"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("名称 / 偏移 / HEX")
+        self.search_edit.setFixedWidth(200)
+        self.search_edit.setClearButtonEnabled(True)
+        info_row.addWidget(self.search_edit)
 
         self.table = QTableWidget(0, 8)
         self.table.setAlternatingRowColors(True)
@@ -236,10 +275,20 @@ class MainWindow(QMainWindow):
         frame_header = QHBoxLayout()
         frame_header.addWidget(QLabel("RX / TX / ERR / ECHO"))
         frame_header.addStretch(1)
+        frame_header.addWidget(QLabel("过滤:"))
+        self.frame_filter_combo = QComboBox()
+        self.frame_filter_combo.addItems(["全部", "RX", "TX", "ERR", "ECHO"])
+        self.frame_filter_edit = QLineEdit()
+        self.frame_filter_edit.setPlaceholderText("HEX / 功能码 / 子类型")
+        self.frame_filter_edit.setFixedWidth(170)
         self.frame_autoscroll_cb = QCheckBox("自动滚动")
         self.frame_autoscroll_cb.setChecked(True)
+        self.export_frame_btn = QPushButton("导出...")
         self.clear_frame_btn = QPushButton("清空")
+        frame_header.addWidget(self.frame_filter_combo)
+        frame_header.addWidget(self.frame_filter_edit)
         frame_header.addWidget(self.frame_autoscroll_cb)
+        frame_header.addWidget(self.export_frame_btn)
         frame_header.addWidget(self.clear_frame_btn)
         self.frame_view = QPlainTextEdit()
         self.frame_view.setReadOnly(True)
@@ -258,8 +307,10 @@ class MainWindow(QMainWindow):
         event_header.addStretch(1)
         self.event_autoscroll_cb = QCheckBox("自动滚动")
         self.event_autoscroll_cb.setChecked(True)
+        self.export_event_btn = QPushButton("导出...")
         self.clear_event_btn = QPushButton("清空")
         event_header.addWidget(self.event_autoscroll_cb)
+        event_header.addWidget(self.export_event_btn)
         event_header.addWidget(self.clear_event_btn)
         self.event_view = QPlainTextEdit()
         self.event_view.setReadOnly(True)
@@ -295,17 +346,42 @@ class MainWindow(QMainWindow):
         self.refresh_ports_btn.clicked.connect(self._refresh_ports)
         self.open_btn.clicked.connect(self._toggle_port)
         self.xml_btn.clicked.connect(self._choose_xml)
+        self.xml_check_btn.clicked.connect(self._check_xml)
         self.reset_btn.clicked.connect(self._reset_data)
         self.auto_cb.toggled.connect(self._update_status)
         self.pause_cb.toggled.connect(self._update_status)
+        self.reconnect_cb.toggled.connect(self._on_reconnect_toggled)
         self.addr_spin.valueChanged.connect(self._update_status)
         self.group_list.currentItemChanged.connect(self._on_group_selected)
         self.table.itemChanged.connect(self._on_item_changed)
-        self.clear_frame_btn.clicked.connect(self.frame_view.clear)
+        self.search_edit.textChanged.connect(self._apply_point_filter)
+        self.format_btn.clicked.connect(self._edit_point_format)
+        self.clear_frame_btn.clicked.connect(self._clear_frame_log)
         self.clear_event_btn.clicked.connect(self.event_view.clear)
+        self.frame_filter_combo.currentIndexChanged.connect(self._render_frame_log)
+        self.frame_filter_edit.textChanged.connect(self._render_frame_log)
+        self.export_frame_btn.clicked.connect(self._export_frames)
+        self.export_event_btn.clicked.connect(self._export_events)
         self.fault_clear_btn.clicked.connect(self._clear_faults)
         self.template_btn.clicked.connect(self._open_templates)
         self.clear_record_btn.clicked.connect(self._clear_recorded)
+
+        self._build_menu()
+
+    def _build_menu(self) -> None:
+        file_menu = self.menuBar().addMenu("文件")
+        file_menu.addAction("加载 XML...", self._choose_xml)
+        file_menu.addSeparator()
+        file_menu.addAction("保存预设...", self._save_preset)
+        file_menu.addAction("加载预设...", self._load_preset)
+        file_menu.addSeparator()
+        file_menu.addAction("退出", self.close)
+
+        tool_menu = self.menuBar().addMenu("工具")
+        tool_menu.addAction("模板...", self._open_templates)
+        tool_menu.addAction("点格式...", self._edit_point_format)
+        tool_menu.addAction("XML 检查...", self._check_xml)
+        tool_menu.addAction("清除故障", self._clear_faults)
 
     # ------------------------------------------------------------- settings
 
@@ -331,12 +407,15 @@ class MainWindow(QMainWindow):
 
         auto = str(self.settings.value("auto_reply", "true")).lower()
         self.auto_cb.setChecked(auto in ("1", "true", "yes"))
+        reconnect = str(self.settings.value("auto_reconnect", "true")).lower()
+        self.reconnect_cb.setChecked(reconnect in ("1", "true", "yes"))
 
     def _save_settings(self) -> None:
         self.settings.setValue("port", self.port_combo.currentData() or "")
         self.settings.setValue("baud", self.baud_combo.currentData() or 9600)
         self.settings.setValue("address", self.addr_spin.value())
         self.settings.setValue("auto_reply", self.auto_cb.isChecked())
+        self.settings.setValue("auto_reconnect", self.reconnect_cb.isChecked())
         if self.device.xml_path:
             self.settings.setValue("xml_path", str(self.device.xml_path))
         self.settings.sync()
@@ -358,15 +437,23 @@ class MainWindow(QMainWindow):
 
     def _toggle_port(self) -> None:
         if self.port.isOpen():
+            self._want_open = False
+            self._reconnect_timer.stop()
             self.port.close()
             self._set_port_open(False)
             self._log("INFO", "串口已关闭")
             return
+        self._open_port(silent=False)
 
+    def _open_port(self, silent: bool = False) -> bool:
         name = self.port_combo.currentData()
         if not name:
-            QMessageBox.warning(self, "提示", "没有可用串口")
-            return
+            if not silent:
+                QMessageBox.warning(self, "提示", "没有可用串口")
+            return False
+
+        if self.port.isOpen():
+            self.port.close()
 
         self.port.setPortName(str(name))
         self.port.setBaudRate(int(self.baud_combo.currentData()))
@@ -376,14 +463,60 @@ class MainWindow(QMainWindow):
         self.port.setFlowControl(QSerialPort.FlowControl.NoFlowControl)
 
         if self.port.open(QIODevice.OpenModeFlag.ReadWrite):
+            self._want_open = True
+            self._desired_port = str(name)
+            self._reconnect_timer.stop()
             self._set_port_open(True)
             self._log(
                 "INFO",
                 f"串口已打开 {name} @ {self.baud_combo.currentData()} 8N1",
             )
-        else:
-            self._log("ERR", f"打开 {name} 失败: {self.port.errorString()}")
+            return True
+
+        self._log("ERR", f"打开 {name} 失败: {self.port.errorString()}")
+        if not silent:
             QMessageBox.critical(self, "串口错误", self.port.errorString())
+        return False
+
+    def _try_reconnect(self) -> None:
+        if self.port.isOpen():
+            self._reconnect_timer.stop()
+            return
+        if not self._want_open or not self.reconnect_cb.isChecked():
+            self._reconnect_timer.stop()
+            return
+        if self._open_port(silent=True):
+            self._log("INFO", "自动重连成功")
+        else:
+            self._log("WARN", "自动重连失败，继续重试")
+
+    def _on_reconnect_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._reconnect_timer.stop()
+
+    def _scan_ports(self) -> None:
+        if self.port.isOpen():
+            return
+        names = [info.portName() for info in QSerialPortInfo.availablePorts()]
+
+        # 自动重连等待期间，不要让热插拔把选择切到别的 COM 口
+        if self._want_open and self._desired_port and self._desired_port not in names:
+            return
+
+        existing = [
+            self.port_combo.itemData(index)
+            for index in range(self.port_combo.count())
+            if self.port_combo.itemData(index)
+        ]
+        if names == existing:
+            return
+
+        current = self.port_combo.currentData()
+        self._refresh_ports()
+        if current:
+            index = self.port_combo.findData(current)
+            if index >= 0:
+                self.port_combo.setCurrentIndex(index)
 
     def _set_port_open(self, opened: bool) -> None:
         self.open_btn.setText("关闭串口" if opened else "打开串口")
@@ -403,6 +536,11 @@ class MainWindow(QMainWindow):
             if self.port.isOpen():
                 self.port.close()
             self._set_port_open(False)
+            if self._want_open and self.reconnect_cb.isChecked():
+                self._reconnect_timer.start()
+                self._log("INFO", "串口异常，2 秒后自动重连")
+            else:
+                self._want_open = False
 
     def _on_ready_read(self) -> None:
         data = bytes(self.port.readAll())
@@ -416,16 +554,20 @@ class MainWindow(QMainWindow):
 
     def _handle_frame(self, frame: Frame) -> None:
         if not frame.valid:
-            self._log_frame("ERR", f"{frame.error} | {frame.raw.hex(' ').upper()}")
+            self._log_frame(
+                "ERR",
+                f"{frame.error} | {frame.raw.hex(' ').upper()}",
+                frame=frame,
+            )
             return
 
         self._rx_count += 1
         self._update_counts()
-        self._log_frame("RX", frame.summary())
+        self._log_frame("RX", frame.summary(), frame=frame)
 
         now = QDateTime.currentMSecsSinceEpoch()
         if frame.raw == self._last_tx and (now - self._last_tx_ms) < 300:
-            self._log_frame("ECHO", "忽略本机发送的回声")
+            self._log_frame("ECHO", "忽略本机发送的回声", frame=frame)
             return
 
         if frame.addr != self.addr_spin.value():
@@ -506,7 +648,7 @@ class MainWindow(QMainWindow):
         self._tx_count += 1
         self._update_counts()
         tx_frame = Frame(data, data[3], data[4], data[5], data[6:-1])
-        self._log_frame("TX", tx_frame.summary())
+        self._log_frame("TX", tx_frame.summary(), frame=tx_frame)
         self._last_tx = data
         self._last_tx_ms = QDateTime.currentMSecsSinceEpoch()
 
@@ -600,9 +742,15 @@ class MainWindow(QMainWindow):
             self.device.load_xml(path)
             self.templates = load_templates(self.templates_path)
             self.device.apply_templates(self.templates)
+            self._xml_stem = Path(path).stem
+            self._formats = load_formats(self.formats_path, self._xml_stem)
         except Exception as exc:  # noqa: BLE001 - 显示给用户即可
             self.device.clear()
+            self._formats = {}
+            self._xml_stem = ""
             self._refresh_group_list()
+            self._xml_issues = []
+            self._xml_notes = []
             self.xml_summary.setText("XML 加载失败")
             self.xml_summary.setToolTip(path)
             self.xml_warnings.setText("⚠ XML 加载失败")
@@ -635,7 +783,88 @@ class MainWindow(QMainWindow):
                 warnings.append("没有定值点（FixValDefine/SetPointDefine 为空）")
         for warning in warnings:
             self._log("WARN", warning)
-        self.xml_warnings.setText("⚠ " + "；".join(warnings) if warnings else "")
+
+        issues = validate_device(self.device)
+        self._xml_notes = list(warnings)
+        self._xml_issues = issues
+        for issue in issues:
+            tag = "ERR" if issue.level == "ERROR" else "WARN"
+            self._log(tag, str(issue))
+
+        total = len(warnings) + len(issues)
+        if total:
+            first = warnings[0] if warnings else issues[0].message
+            suffix = f"（共 {total} 项）" if total > 1 else ""
+            self.xml_warnings.setText(f"⚠ {first}{suffix}")
+        else:
+            self.xml_warnings.setText("")
+
+    def _check_xml(self) -> None:
+        if self.device.xml_path is None:
+            QMessageBox.information(self, "XML 检查", "请先加载 XML")
+            return
+        dialog = XmlCheckDialog(
+            self,
+            str(self.device.xml_path),
+            self._xml_notes,
+            self._xml_issues,
+        )
+        dialog.exec()
+
+    def _save_preset(self) -> None:
+        if not self.device.groups:
+            QMessageBox.information(self, "保存预设", "请先加载 XML")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存预设",
+            str(self.app_dir / "data" / "preset.json"),
+            "JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            save_preset(path, self.device)
+        except OSError as exc:
+            QMessageBox.critical(self, "保存预设失败", str(exc))
+            return
+        self._log("INFO", f"预设已保存: {path}")
+
+    def _load_preset(self) -> None:
+        if not self.device.groups:
+            QMessageBox.information(self, "加载预设", "请先加载 XML")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "加载预设",
+            str(self.app_dir / "data"),
+            "JSON (*.json);;所有文件 (*)",
+        )
+        if not path:
+            return
+        try:
+            preset = load_preset(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "加载预设失败", str(exc))
+            return
+
+        preset_xml = str(preset.get("xml", "") or "")
+        if preset_xml and self.device.xml_path is not None:
+            if Path(preset_xml).name != self.device.xml_path.name:
+                QMessageBox.information(
+                    self,
+                    "预设提示",
+                    f"预设来自 {Path(preset_xml).name}，只应用当前 XML 中存在的组。",
+                )
+
+        applied, skipped, notes = apply_preset(self.device, preset)
+        if self._current_group is not None:
+            self._populate_group(self._current_group)
+        self._log("INFO", f"预设已加载: 应用 {applied} 组，跳过 {skipped} 组")
+        for note in notes:
+            self._log("WARN", note)
+        if applied == 0:
+            QMessageBox.warning(self, "加载预设", "没有匹配到任何组")
 
     def _refresh_group_list(self) -> None:
         self.group_list.blockSignals(True)
@@ -724,6 +953,23 @@ class MainWindow(QMainWindow):
             self._populate_numeric(group)
 
         self.table.blockSignals(False)
+        self._apply_point_filter()
+
+    def _apply_point_filter(self) -> None:
+        if not hasattr(self, "search_edit"):
+            return
+        text = self.search_edit.text().strip().lower()
+        for row in range(self.table.rowCount()):
+            if not text:
+                self.table.setRowHidden(row, False)
+                continue
+            matched = False
+            for column in range(self.table.columnCount()):
+                item = self.table.item(row, column)
+                if item is not None and text in item.text().lower():
+                    matched = True
+                    break
+            self.table.setRowHidden(row, not matched)
 
     def _populate_numeric(self, group: Group) -> None:
         headers = [
@@ -766,18 +1012,39 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, 7, self._make_item(f"bit {point.inf}"))
                 continue
 
-            raw = self._read_raw(group, point)
-            raw_hex = format_hex(group.data[point.fun : point.fun + point.inf])
-            factor = point.factor
+            fmt = self._format_for(point)
+            raw_bytes = self._read_point_bytes(group, point)
+            raw_hex = format_hex(raw_bytes)
+            raw_value = fmt.decode_raw(raw_bytes)
+            scale = fmt.effective_scale(point.factor)
+            engineering_value = fmt.decode_eng(raw_bytes, point.factor)
+
             show_decimal = 0 < point.inf <= 4
-            raw_dec = str(raw) if show_decimal else "-"
-            engineering = f"{raw * factor:g}" if show_decimal else "-"
+            if fmt.is_float(point.inf) and point.inf == 4:
+                raw_dec = f"{raw_value:g}"
+            elif show_decimal:
+                raw_dec = str(int(round(raw_value)))
+            else:
+                raw_dec = "-"
+            engineering = (
+                f"{engineering_value:g}" if 0 < point.inf <= 4 else "-"
+            )
+
             note_parts = []
+            description = fmt.describe()
+            if description:
+                note_parts.append(description)
             if point.ied_dot:
                 note_parts.append(f"ID={point.ied_dot}")
             if point.kind == "FIX" and point.value_type:
                 note_parts.append(f"ValueType={point.value_type}")
             note = " | ".join(note_parts)
+
+            coefficient_editable = (
+                point.kind == "FIX"
+                and fmt.code == "auto"
+                and fmt.scale is None
+            )
 
             self.table.setItem(row, 0, self._make_item(point.name or "(未命名)"))
             self.table.setItem(row, 1, self._make_item(str(point.fun)))
@@ -789,10 +1056,15 @@ class MainWindow(QMainWindow):
             self.table.setItem(
                 row,
                 5,
-                self._make_item(f"{factor:g}", editable=point.kind == "FIX"),
+                self._make_item(f"{scale:g}", editable=coefficient_editable),
             )
             self.table.setItem(
-                row, 6, self._make_item(engineering, editable=show_decimal)
+                row,
+                6,
+                self._make_item(
+                    engineering,
+                    editable=0 < point.inf <= 4,
+                ),
             )
             self.table.setItem(row, 7, self._make_item(note))
 
@@ -889,26 +1161,57 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- value edits
 
-    def _read_raw(self, group: Group, point: Point) -> int:
-        if point.inf <= 0:
-            return 0
-        end = point.fun + point.inf
-        if end > len(group.data):
-            group.data.extend(b"\x00" * (end - len(group.data)))
-        return int.from_bytes(group.data[point.fun:end], "big")
+    def _format_for(self, point: Point) -> PointFormat:
+        return self._formats.get(point_key(point), PointFormat())
 
-    def _write_raw(self, group: Group, point: Point, raw: int) -> bool:
+    def _read_point_bytes(self, group: Group, point: Point) -> bytes:
         if point.inf <= 0:
-            return False
-        max_raw = (1 << (8 * point.inf)) - 1
-        if raw < 0 or raw > max_raw:
-            self._log("ERR", f"{point.name} 超出范围 0..{max_raw}")
+            return b""
+        end = point.fun + point.inf
+        if end > len(group.data):
+            group.data.extend(b"\x00" * (end - len(group.data)))
+        return bytes(group.data[point.fun:end])
+
+    def _write_point_bytes(self, group: Group, point: Point, data: bytes) -> bool:
+        if point.inf <= 0 or len(data) != point.inf:
             return False
         end = point.fun + point.inf
         if end > len(group.data):
             group.data.extend(b"\x00" * (end - len(group.data)))
-        group.data[point.fun:end] = int(raw).to_bytes(point.inf, "big")
+        group.data[point.fun:end] = data
         return True
+
+    def _edit_point_format(self) -> None:
+        group = self._current_group
+        if group is None:
+            QMessageBox.information(self, "点格式", "请先选择一个组")
+            return
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._row_specs):
+            QMessageBox.information(self, "点格式", "请先在点表里选择一个点")
+            return
+        spec = self._row_specs[row]
+        if spec[0] != "point" or spec[1].kind not in ("YC", "FIX"):
+            QMessageBox.information(self, "点格式", "只有遥测/定值点可以设置数据格式")
+            return
+
+        point = spec[1]
+        dialog = PointFormatDialog(self, point, self._format_for(point))
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.result is None:
+            return
+
+        self._formats[point_key(point)] = dialog.result
+        try:
+            save_formats(self.formats_path, self._xml_stem, self._formats)
+        except OSError as exc:
+            self._log("ERR", f"保存点格式失败: {exc}")
+
+        self._populate_group(group)
+        self._log(
+            "INFO",
+            f"点格式已更新: {point.name or '(未命名)'} -> "
+            f"{dialog.result.describe() or 'auto'}",
+        )
 
     def _write_bit(self, group: Group, point: Point, checked: bool) -> None:
         if not (0 <= point.inf < 8):
@@ -925,13 +1228,26 @@ class MainWindow(QMainWindow):
         self._updating = True
         self.table.blockSignals(True)
         try:
-            raw = self._read_raw(group, point)
-            raw_hex = format_hex(group.data[point.fun : point.fun + point.inf])
-            factor = point.factor
-            self.table.item(row, 3).setText(raw_hex)
-            self.table.item(row, 4).setText(str(raw))
-            self.table.item(row, 5).setText(f"{factor:g}")
-            self.table.item(row, 6).setText(f"{raw * factor:g}")
+            fmt = self._format_for(point)
+            raw_bytes = self._read_point_bytes(group, point)
+            raw_value = fmt.decode_raw(raw_bytes)
+            scale = fmt.effective_scale(point.factor)
+            engineering_value = fmt.decode_eng(raw_bytes, point.factor)
+
+            show_decimal = 0 < point.inf <= 4
+            if fmt.is_float(point.inf) and point.inf == 4:
+                raw_dec = f"{raw_value:g}"
+            elif show_decimal:
+                raw_dec = str(int(round(raw_value)))
+            else:
+                raw_dec = "-"
+
+            self.table.item(row, 3).setText(format_hex(raw_bytes))
+            self.table.item(row, 4).setText(raw_dec)
+            self.table.item(row, 5).setText(f"{scale:g}")
+            self.table.item(row, 6).setText(
+                f"{engineering_value:g}" if 0 < point.inf <= 4 else "-"
+            )
         finally:
             self.table.blockSignals(False)
             self._updating = False
@@ -995,6 +1311,8 @@ class MainWindow(QMainWindow):
         if point.kind == "YX":
             return
 
+        fmt = self._format_for(point)
+
         if column == 3:
             try:
                 data = parse_hex(item.text())
@@ -1006,21 +1324,28 @@ class MainWindow(QMainWindow):
                 self._log("ERR", f"HEX 长度应为 {point.inf} 字节")
                 self._refresh_numeric_row(group, point, row)
                 return
-            raw = int.from_bytes(data, "big") if data else 0
-            if not self._write_raw(group, point, raw):
+            if not self._write_point_bytes(group, point, data):
                 self._refresh_numeric_row(group, point, row)
                 return
         elif column == 4:
             try:
-                raw = int(item.text().strip(), 0)
-            except ValueError:
-                self._log("ERR", f"原始值必须是整数: {item.text()}")
+                text = item.text().strip()
+                value = float(text) if fmt.is_float(point.inf) else int(text, 0)
+                data = fmt.encode_raw(value, point.inf)
+            except (ValueError, OverflowError, struct.error):
+                self._log("ERR", f"原始值格式错误: {item.text()}")
                 self._refresh_numeric_row(group, point, row)
                 return
-            if not self._write_raw(group, point, raw):
+            if not self._write_point_bytes(group, point, data):
                 self._refresh_numeric_row(group, point, row)
                 return
         elif column == 5:
+            if not (
+                point.kind == "FIX"
+                and fmt.code == "auto"
+                and fmt.scale is None
+            ):
+                return
             try:
                 value = float(item.text().strip())
             except ValueError:
@@ -1037,16 +1362,12 @@ class MainWindow(QMainWindow):
         elif column == 6:
             try:
                 value = float(item.text().strip())
-            except ValueError:
-                self._log("ERR", f"工程值必须是数字: {item.text()}")
+                data = fmt.encode_eng(value, point.inf, point.factor)
+            except (ValueError, OverflowError, struct.error) as exc:
+                self._log("ERR", f"工程值换算失败: {exc}")
                 self._refresh_numeric_row(group, point, row)
                 return
-            factor = point.factor
-            if factor == 0:
-                self._log("ERR", "系数为 0，无法换算")
-                self._refresh_numeric_row(group, point, row)
-                return
-            if not self._write_raw(group, point, round(value / factor)):
+            if not self._write_point_bytes(group, point, data):
                 self._refresh_numeric_row(group, point, row)
                 return
         else:
@@ -1178,26 +1499,142 @@ class MainWindow(QMainWindow):
         self.count_label.setText(f"RX {self._rx_count} / TX {self._tx_count}")
 
     def _log(self, tag: str, text: str) -> None:
-        self._append_log(self.event_view, self.event_autoscroll_cb, tag, text)
+        timestamp = QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
+        line = f"[{timestamp}] {tag:<5} {text}"
+        self._append_line(self.event_view, self.event_autoscroll_cb, line)
 
-    def _log_frame(self, tag: str, text: str) -> None:
-        self._append_log(self.frame_view, self.frame_autoscroll_cb, tag, text)
+    def _log_frame(self, tag: str, text: str, frame: Frame | None = None) -> None:
+        timestamp = QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
+        line = f"[{timestamp}] {tag:<5} {text}"
+        record = {
+            "time": timestamp,
+            "tag": tag,
+            "text": text,
+            "line": line,
+            "frame": frame,
+        }
+        self._frame_records.append(record)
+        if len(self._frame_records) > 5000:
+            self._frame_records.pop(0)
+        if self._frame_filter_matches(record):
+            self._append_line(self.frame_view, self.frame_autoscroll_cb, line)
+
+    def _frame_filter_matches(self, record: dict) -> bool:
+        direction = self.frame_filter_combo.currentText()
+        if direction and direction != "全部" and record["tag"] != direction:
+            return False
+        query = self.frame_filter_edit.text().strip().lower()
+        if query and query not in record["text"].lower():
+            return False
+        return True
+
+    def _render_frame_log(self, *_args) -> None:
+        self.frame_view.clear()
+        for record in self._frame_records:
+            if self._frame_filter_matches(record):
+                self._append_line(
+                    self.frame_view,
+                    self.frame_autoscroll_cb,
+                    record["line"],
+                )
+
+    def _clear_frame_log(self) -> None:
+        self._frame_records.clear()
+        self.frame_view.clear()
+
+    def _export_frames(self) -> None:
+        records = [
+            record
+            for record in self._frame_records
+            if self._frame_filter_matches(record)
+        ]
+        if not records:
+            QMessageBox.information(self, "导出报文", "当前过滤条件下没有报文")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出报文",
+            str(self.app_dir / "data" / "frames.csv"),
+            "CSV (*.csv)",
+        )
+        if not path:
+            return
+        try:
+            self._write_frames_csv(path, records)
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        self._log("INFO", f"已导出 {len(records)} 条报文: {path}")
 
     @staticmethod
-    def _append_log(
+    def _write_frames_csv(path: str, records: list[dict]) -> None:
+        with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                ["时间", "方向", "地址", "功能码", "子类型", "数据长度", "原始帧"]
+            )
+            for record in records:
+                frame = record.get("frame")
+                if frame is not None:
+                    writer.writerow(
+                        [
+                            record["time"],
+                            record["tag"],
+                            frame.addr,
+                            f"0x{frame.func:02X}",
+                            f"0x{frame.subtype:02X}",
+                            len(frame.data),
+                            frame.hex(),
+                        ]
+                    )
+                else:
+                    writer.writerow(
+                        [
+                            record["time"],
+                            record["tag"],
+                            "",
+                            "",
+                            "",
+                            "",
+                            record["text"],
+                        ]
+                    )
+
+    def _export_events(self) -> None:
+        text = self.event_view.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "导出运行日志", "运行日志为空")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出运行日志",
+            str(self.app_dir / "data" / "events.txt"),
+            "文本 (*.txt)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        self._log("INFO", f"运行日志已导出: {path}")
+
+    @staticmethod
+    def _append_line(
         view: QPlainTextEdit,
         autoscroll: QCheckBox,
-        tag: str,
-        text: str,
+        line: str,
     ) -> None:
-        timestamp = QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
-        view.appendPlainText(f"[{timestamp}] {tag:<5} {text}")
+        view.appendPlainText(line)
         if autoscroll.isChecked():
             bar = view.verticalScrollBar()
             bar.setValue(bar.maximum())
 
     def closeEvent(self, event) -> None:
         self._save_settings()
+        self._port_scan_timer.stop()
+        self._reconnect_timer.stop()
         if self.port.isOpen():
             self.port.close()
         super().closeEvent(event)
