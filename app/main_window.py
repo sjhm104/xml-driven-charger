@@ -64,6 +64,8 @@ from app.template_store import load_templates
 from app.xml_check_dialog import XmlCheckDialog
 from app.xml_validator import validate_device
 
+CATEGORY_ORDER = ["YC", "YX", "YK", "FIX"]
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -116,6 +118,7 @@ class MainWindow(QMainWindow):
         self._last_tx_ms = 0
         self._updating = False
         self._current_group: Group | None = None
+        self.category = "YC"
         self._row_specs: list[tuple] = []
         self._xml_issues: list = []
         self._xml_notes: list[str] = []
@@ -123,12 +126,17 @@ class MainWindow(QMainWindow):
         self._tx_count = 0
 
         self._build_ui()
+        self._refresh_categories()
         self._refresh_ports()
         self._load_settings()
         self._set_port_open(False)
         self._port_scan_timer.start()
         self._update_counts()
-        self._log("INFO", "工具启动。请选择串口并加载装置类型表 XML。")
+        self._log(
+            "INFO",
+            "工具启动。COM 口是电脑上的 USB-RS485 适配器；选好后点"
+            "“打开串口”，报文监视才会出现 DTU 轮询帧。",
+        )
 
         self.port.readyRead.connect(self._on_ready_read)
         self.port.errorOccurred.connect(self._on_serial_error)
@@ -145,7 +153,10 @@ class MainWindow(QMainWindow):
 
         top.addWidget(QLabel("串口:"))
         self.port_combo = QComboBox()
-        self.port_combo.setMinimumWidth(230)
+        self.port_combo.setMinimumWidth(190)
+        self.port_combo.setToolTip(
+            "电脑上 USB-RS485 适配器对应的 COM 口；A/B 接到 DTU 的电源模块 485 口"
+        )
         top.addWidget(self.port_combo)
         self.refresh_ports_btn = QPushButton("刷新")
         top.addWidget(self.refresh_ports_btn)
@@ -158,7 +169,14 @@ class MainWindow(QMainWindow):
 
         self.open_btn = QPushButton("打开串口")
         self.open_btn.setMinimumWidth(96)
+        self.open_btn.setToolTip("必须打开串口才能收到 DTU 的轮询报文")
         top.addWidget(self.open_btn)
+
+        self.port_state_label = QLabel("串口未打开")
+        self.port_state_label.setStyleSheet(
+            "color: #c0392b; font-weight: bold;"
+        )
+        top.addWidget(self.port_state_label)
 
         self.reconnect_cb = QCheckBox("自动重连")
         self.reconnect_cb.setChecked(True)
@@ -184,6 +202,9 @@ class MainWindow(QMainWindow):
         top.addWidget(self.pause_cb)
 
         self.reset_btn = QPushButton("重置数据")
+        self.reset_btn.setToolTip(
+            "所有组重置为模板/零值；电池模型运行时请先停止模型"
+        )
         top.addWidget(self.reset_btn)
         top.addStretch(1)
 
@@ -233,13 +254,19 @@ class MainWindow(QMainWindow):
         aux.addWidget(fault_group, 1)
         aux.addWidget(template_group)
 
-        # 左侧组列表
-        self.group_list = QListWidget()
-        self.group_list.setMinimumWidth(250)
+        self.aux_widget = QWidget()
+        self.aux_widget.setLayout(aux)
+        self.aux_widget.setVisible(False)
+
+        # 左侧：按数据类型查看
+        self.category_list = QListWidget()
+        self.category_list.setMinimumWidth(250)
+        self.category_list.setMaximumHeight(150)
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(QLabel("组（功能码 / 子类型）"))
+        left_layout.addWidget(QLabel("数据类型"))
+        left_layout.addWidget(self.category_list)
         self.xml_summary = QLabel("未加载 XML")
         self.xml_summary.setWordWrap(True)
         self.xml_summary.setStyleSheet("color: #555;")
@@ -250,7 +277,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.xml_warnings)
         self.xml_check_btn = QPushButton("XML 检查...")
         left_layout.addWidget(self.xml_check_btn)
-        left_layout.addWidget(self.group_list)
+        left_layout.addStretch(1)
 
         # 右侧：点表
         self.group_title = QLabel("未选择组")
@@ -272,7 +299,7 @@ class MainWindow(QMainWindow):
         self.search_edit.setClearButtonEnabled(True)
         info_row.addWidget(self.search_edit)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(
@@ -444,14 +471,16 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root_layout = QVBoxLayout(root)
         root_layout.addLayout(top)
-        root_layout.addLayout(aux)
+        root_layout.addWidget(self.aux_widget)
         root_layout.addWidget(splitter, 1)
         self.setCentralWidget(root)
 
         self.status_label = QLabel("串口未打开")
         self.count_label = QLabel("RX 0 / TX 0")
+        self.sim_status_label = QLabel("电池模型: 停止 | 场景: 停止")
         self.statusBar().addWidget(self.status_label, 1)
         self.statusBar().addPermanentWidget(self.count_label)
+        self.statusBar().addPermanentWidget(self.sim_status_label)
 
         self.refresh_ports_btn.clicked.connect(self._refresh_ports)
         self.open_btn.clicked.connect(self._toggle_port)
@@ -462,7 +491,8 @@ class MainWindow(QMainWindow):
         self.pause_cb.toggled.connect(self._update_status)
         self.reconnect_cb.toggled.connect(self._on_reconnect_toggled)
         self.addr_spin.valueChanged.connect(self._update_status)
-        self.group_list.currentItemChanged.connect(self._on_group_selected)
+        self.category_list.currentItemChanged.connect(self._on_category_selected)
+        self.table.currentCellChanged.connect(self._on_table_row_changed)
         self.table.itemChanged.connect(self._on_item_changed)
         self.search_edit.textChanged.connect(self._apply_point_filter)
         self.format_btn.clicked.connect(self._edit_point_format)
@@ -508,10 +538,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction("退出", self.close)
 
         tool_menu = self.menuBar().addMenu("工具")
-        tool_menu.addAction("模板...", self._open_templates)
         tool_menu.addAction("点格式...", self._edit_point_format)
         tool_menu.addAction("XML 检查...", self._check_xml)
-        tool_menu.addAction("清除故障", self._clear_faults)
+        tool_menu.addSeparator()
+        self.aux_action = tool_menu.addAction("显示高级工具栏")
+        self.aux_action.setCheckable(True)
+        self.aux_action.toggled.connect(self.aux_widget.setVisible)
 
     # ------------------------------------------------------------- settings
 
@@ -650,6 +682,12 @@ class MainWindow(QMainWindow):
 
     def _set_port_open(self, opened: bool) -> None:
         self.open_btn.setText("关闭串口" if opened else "打开串口")
+        self.port_state_label.setText("串口已打开" if opened else "串口未打开")
+        self.port_state_label.setStyleSheet(
+            "color: #1e8449; font-weight: bold;"
+            if opened
+            else "color: #c0392b; font-weight: bold;"
+        )
         self.port_combo.setEnabled(not opened)
         self.baud_combo.setEnabled(not opened)
         self.refresh_ports_btn.setEnabled(not opened)
@@ -725,8 +763,7 @@ class MainWindow(QMainWindow):
 
         if frame.func == 0x1A and frame.subtype == 0x0C:
             self.device.reset_defaults(self.templates)
-            if self._current_group is not None:
-                self._populate_group(self._current_group)
+            self._populate_category(self.category)
 
         if self.battery_timer.isActive():
             if frame.func == 0x02:
@@ -774,13 +811,8 @@ class MainWindow(QMainWindow):
         else:
             self._send_response(fault.data)
 
-        if (
-            self._current_group is not None
-            and frame.func == 0x1A
-            and frame.subtype != 0x0C
-            and self._current_group.key == (0x1B, frame.subtype)
-        ):
-            self._populate_group(self._current_group)
+        if frame.func == 0x1A and frame.subtype != 0x0C:
+            self._populate_category(self.category)
 
     def _send_response(self, data: bytes) -> None:
         if not self.port.isOpen():
@@ -858,10 +890,16 @@ class MainWindow(QMainWindow):
         self._log("INFO", "录制缓存已清空")
 
     def _open_templates(self) -> None:
+        row = self.table.currentRow()
+        selected_group = (
+            self._row_specs[row][1]
+            if 0 <= row < len(self._row_specs)
+            else None
+        )
         dialog = TemplateDialog(
             self,
             self.templates,
-            self._current_group,
+            selected_group,
             self.recorded_frames,
             self.templates_path,
         )
@@ -871,7 +909,7 @@ class MainWindow(QMainWindow):
         self.templates = dict(dialog.templates)
         if dialog.apply_now:
             self.device.reset_defaults(self.templates)
-            self._refresh_group_list()
+            self._refresh_categories()
             self._log("INFO", "模板已保存并应用（所有组已按模板重置）")
         else:
             self._log("INFO", "模板已保存（下次加载 XML 时生效）")
@@ -882,6 +920,11 @@ class MainWindow(QMainWindow):
         if not self.device.groups:
             QMessageBox.information(self, "电池模型", "请先加载 XML")
             return
+        if not self.port.isOpen():
+            self._log(
+                "WARN",
+                "串口未打开：模型只在本地运行，DTU 收不到应答",
+            )
         if self.scenario_timer.isActive():
             self._stop_scenario()
         self.battery_model.reset()
@@ -1018,10 +1061,10 @@ class MainWindow(QMainWindow):
         self.battery_stop_btn.setEnabled(running)
         self.battery_activation_btn.setEnabled(running)
         self.battery_activation_stop_btn.setEnabled(running)
+        self._update_sim_status()
 
     def _refresh_current_values(self) -> None:
-        group = self._current_group
-        if group is None or not self._row_specs:
+        if not self._row_specs:
             return
         if self.table.state() == QAbstractItemView.State.EditingState:
             return
@@ -1032,19 +1075,20 @@ class MainWindow(QMainWindow):
             for row, spec in enumerate(self._row_specs):
                 if row >= self.table.rowCount():
                     break
+                group = spec[1]
                 if spec[0] == "ext":
-                    start, length = spec[1]
+                    start, length = spec[2]
                     raw = self._read_range(group, start, length)
                     show_decimal = 0 < length <= 4
                     raw_dec = str(raw) if show_decimal else "-"
-                    self.table.item(row, 3).setText(
+                    self.table.item(row, 4).setText(
                         format_hex(group.data[start : start + length])
                     )
-                    self.table.item(row, 4).setText(raw_dec)
-                    self.table.item(row, 6).setText(raw_dec)
+                    self.table.item(row, 5).setText(raw_dec)
+                    self.table.item(row, 7).setText(raw_dec)
                     continue
 
-                point = spec[1]
+                point = spec[2]
                 if point.kind == "YX":
                     byte_value = (
                         group.data[point.fun] if point.fun < len(group.data) else 0
@@ -1054,7 +1098,7 @@ class MainWindow(QMainWindow):
                         if 0 <= point.inf < 8
                         else False
                     )
-                    item = self.table.item(row, 3)
+                    item = self.table.item(row, 4)
                     if item is not None:
                         item.setCheckState(
                             Qt.CheckState.Checked
@@ -1077,10 +1121,10 @@ class MainWindow(QMainWindow):
                     raw_dec = str(int(round(raw_value)))
                 else:
                     raw_dec = "-"
-                self.table.item(row, 3).setText(format_hex(raw_bytes))
-                self.table.item(row, 4).setText(raw_dec)
-                self.table.item(row, 5).setText(f"{scale:g}")
-                self.table.item(row, 6).setText(
+                self.table.item(row, 4).setText(format_hex(raw_bytes))
+                self.table.item(row, 5).setText(raw_dec)
+                self.table.item(row, 6).setText(f"{scale:g}")
+                self.table.item(row, 7).setText(
                     f"{engineering:g}" if show_decimal else "-"
                 )
         finally:
@@ -1120,6 +1164,11 @@ class MainWindow(QMainWindow):
         if not self.device.groups:
             QMessageBox.information(self, "场景", "请先加载 XML")
             return
+        if not self.port.isOpen():
+            self._log(
+                "WARN",
+                "串口未打开：场景只在本地运行，DTU 收不到应答",
+            )
         if self.battery_timer.isActive():
             self._stop_battery()
 
@@ -1187,6 +1236,16 @@ class MainWindow(QMainWindow):
             self.scenario is not None and not running
         )
         self.scenario_stop_btn.setEnabled(running)
+        self._update_sim_status()
+
+    def _update_sim_status(self) -> None:
+        if not hasattr(self, "sim_status_label"):
+            return
+        battery = "运行" if self.battery_timer.isActive() else "停止"
+        scenario = "运行" if self.scenario_timer.isActive() else "停止"
+        self.sim_status_label.setText(
+            f"电池模型: {battery} | 场景: {scenario}"
+        )
 
     # ------------------------------------------------------------------ xml
 
@@ -1220,7 +1279,7 @@ class MainWindow(QMainWindow):
             self.device.clear()
             self._formats = {}
             self._xml_stem = ""
-            self._refresh_group_list()
+            self._refresh_categories()
             self._xml_issues = []
             self._xml_notes = []
             self.xml_summary.setText("XML 加载失败")
@@ -1230,7 +1289,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "XML 加载失败", f"{path}\n\n{exc}")
             return
 
-        self._refresh_group_list()
+        self._refresh_categories()
         counts = self.device.point_counts()
         summary = (
             f"遥测 {counts['YC']} / 遥信 {counts['YX']} / "
@@ -1242,6 +1301,11 @@ class MainWindow(QMainWindow):
             "INFO",
             f"已加载 XML: {path} | {summary} | 模板 {len(self.templates)}",
         )
+        if not self.port.isOpen():
+            self._log(
+                "WARN",
+                "串口未打开：收不到 DTU 轮询；点“打开串口”开始监听",
+            )
 
         warnings: list[str] = []
         if not self.device.groups:
@@ -1330,49 +1394,68 @@ class MainWindow(QMainWindow):
                 )
 
         applied, skipped, notes = apply_preset(self.device, preset)
-        if self._current_group is not None:
-            self._populate_group(self._current_group)
+        self._populate_category(self.category)
         self._log("INFO", f"预设已加载: 应用 {applied} 组，跳过 {skipped} 组")
         for note in notes:
             self._log("WARN", note)
         if applied == 0:
             QMessageBox.warning(self, "加载预设", "没有匹配到任何组")
 
-    def _refresh_group_list(self) -> None:
-        self.group_list.blockSignals(True)
-        self.group_list.clear()
-        for group in self.device.sorted_groups():
-            item = QListWidgetItem(group.title)
-            item.setData(Qt.ItemDataRole.UserRole, group.key)
-            item.setToolTip(
-                f"功能码=0x{group.fun_type:04X} "
-                f"类型={KIND_NAMES.get(group.kind, group.kind)} "
-                f"点数={len(group.points)} 数据区={len(group.data)}B"
-            )
-            self.group_list.addItem(item)
-        self.group_list.blockSignals(False)
+    def _refresh_categories(self) -> None:
+        counts = self.device.point_counts()
+        current = self.category if self.category in CATEGORY_ORDER else "YC"
+        self.category_list.blockSignals(True)
+        self.category_list.clear()
+        for kind in CATEGORY_ORDER:
+            item = QListWidgetItem(f"{KIND_NAMES[kind]}  ({counts[kind]})")
+            item.setData(Qt.ItemDataRole.UserRole, kind)
+            self.category_list.addItem(item)
+        self.category_list.blockSignals(False)
+        self.category_list.setCurrentRow(CATEGORY_ORDER.index(current))
 
-        if self.group_list.count() > 0:
-            self.group_list.setCurrentRow(0)
+    def _on_category_selected(
+        self, item: QListWidgetItem | None, _previous=None
+    ) -> None:
+        if item is None:
+            return
+        kind = item.data(Qt.ItemDataRole.UserRole)
+        if kind not in CATEGORY_ORDER:
+            return
+        self.category = kind
+        self._current_group = None
+        self._populate_category(kind)
+
+    def _on_table_row_changed(
+        self,
+        current_row: int,
+        _current_column: int,
+        _previous_row: int,
+        _previous_column: int,
+    ) -> None:
+        if 0 <= current_row < len(self._row_specs):
+            self._current_group = self._row_specs[current_row][1]
         else:
             self._current_group = None
-            self._clear_detail()
 
-    def _on_group_selected(self, item: QListWidgetItem | None, _previous=None) -> None:
-        if item is None:
-            self._current_group = None
-            self._clear_detail()
-            return
-        key = item.data(Qt.ItemDataRole.UserRole)
-        group = self.device.groups.get(key) if isinstance(key, tuple) else None
-        if group is None:
-            self._current_group = None
-            self._clear_detail()
-            return
-        self._current_group = group
-        self._populate_group(group)
+    def _collect_category_rows(self, kind: str) -> list[tuple]:
+        rows: list[tuple] = []
+        for group in self.device.sorted_groups():
+            points = [point for point in group.points if point.kind == kind]
+            for point in points:
+                rows.append(("point", group, point))
 
-    # ----------------------------------------------------------------- table
+            if kind in ("YC", "FIX"):
+                if points and group.kind in ("YC", "FIX", "MIX"):
+                    for start, length in self._unmapped_ranges(group):
+                        rows.append(("ext", group, (start, length)))
+                elif (
+                    not group.points
+                    and group.kind == "RAW"
+                    and kind == "FIX"
+                ):
+                    if group.data:
+                        rows.append(("ext", group, (0, len(group.data))))
+        return rows
 
     def _style_table(self, headers: list[str]) -> None:
         self.table.setColumnCount(len(headers))
@@ -1380,9 +1463,14 @@ class MainWindow(QMainWindow):
         header = self.table.horizontalHeader()
         header.setStretchLastSection(True)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        widths = [240, 80, 70, 150, 110, 80, 110]
-        for index in range(min(len(headers) - 1, len(widths))):
-            self.table.setColumnWidth(index, widths[index])
+        if len(headers) == 9:
+            widths = [75, 190, 60, 55, 130, 95, 65, 95]
+        elif len(headers) == 6:
+            widths = [75, 200, 65, 55, 105]
+        else:
+            widths = []
+        for index, width in enumerate(widths):
+            self.table.setColumnWidth(index, width)
 
     @staticmethod
     def _make_item(text: str, editable: bool = False) -> QTableWidgetItem:
@@ -1390,42 +1478,6 @@ class MainWindow(QMainWindow):
         if not editable:
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         return item
-
-    def _clear_detail(self) -> None:
-        self.group_title.setText("未选择组")
-        self.group_info.setText("")
-        self.table.blockSignals(True)
-        self.table.clear()
-        self.table.clearSpans()
-        self.table.setRowCount(0)
-        self.table.setColumnCount(0)
-        self.table.blockSignals(False)
-        self._row_specs = []
-
-    def _populate_group(self, group: Group) -> None:
-        self._current_group = group
-        self._row_specs = []
-        self.table.blockSignals(True)
-        self.table.clear()
-        self.table.clearSpans()
-        self.table.setRowCount(0)
-
-        self.group_title.setText(
-            f"0x{group.fun_type:04X}  {KIND_NAMES.get(group.kind, group.kind)}"
-        )
-        self.group_info.setText(
-            f"数据区 {len(group.data)} 字节 | XML 点 {len(group.points)} 个"
-        )
-
-        if group.kind == "YK":
-            self._populate_yk(group)
-        elif group.kind == "YX":
-            self._populate_yx(group)
-        else:
-            self._populate_numeric(group)
-
-        self.table.blockSignals(False)
-        self._apply_point_filter()
 
     def _apply_point_filter(self) -> None:
         if not hasattr(self, "search_edit"):
@@ -1443,172 +1495,219 @@ class MainWindow(QMainWindow):
                     break
             self.table.setRowHidden(row, not matched)
 
-    def _populate_numeric(self, group: Group) -> None:
-        headers = [
-            "名称",
-            "偏移",
-            "长度",
-            "原始值(HEX)",
-            "原始值",
-            "系数",
-            "工程值",
-            "说明",
-        ]
-        self._style_table(headers)
-        points = group.points
-        gaps = self._unmapped_ranges(group)
-        row_count = len(points) + len(gaps)
-        self.table.setRowCount(max(1, row_count))
+    def _clear_table_widgets(self) -> None:
+        for row in range(self.table.rowCount()):
+            for column in range(self.table.columnCount()):
+                if self.table.cellWidget(row, column) is not None:
+                    self.table.removeCellWidget(row, column)
+
+    def _clear_detail(self) -> None:
+        self.group_title.setText("未选择数据类型")
+        self.group_info.setText("")
+        self.table.blockSignals(True)
+        self._clear_table_widgets()
+        self.table.clear()
+        self.table.clearSpans()
+        self.table.setRowCount(0)
+        self.table.setColumnCount(0)
+        self.table.blockSignals(False)
         self._row_specs = []
 
-        if row_count == 0:
-            item = self._make_item("该组没有数据区")
-            self.table.setItem(0, 0, item)
-            self.table.setSpan(0, 0, 1, len(headers))
-            return
+    def _populate_category(self, kind: str) -> None:
+        self._row_specs = []
+        self.table.blockSignals(True)
+        self._clear_table_widgets()
+        self.table.clear()
+        self.table.clearSpans()
+        self.table.setRowCount(0)
 
-        for row, point in enumerate(points):
-            self._row_specs.append(("point", point))
-            if point.kind == "YX":
-                byte_value = group.data[point.fun] if point.fun < len(group.data) else 0
-                bit_value = (
-                    (byte_value >> point.inf) & 0x01 if 0 <= point.inf < 8 else 0
+        rows = self._collect_category_rows(kind)
+        self.group_title.setText(KIND_NAMES.get(kind, kind))
+        self.group_info.setText(f"共 {len(rows)} 行")
+
+        if kind == "YK":
+            headers = ["组", "名称", "功能码", "子类型", "应答结果", "说明"]
+            self._style_table(headers)
+            self.table.setRowCount(max(1, len(rows)))
+            if not rows:
+                self.table.setItem(0, 0, self._make_item("没有遥控点"))
+                self.table.setSpan(0, 0, 1, len(headers))
+            for row, spec in enumerate(rows):
+                self._row_specs.append(spec)
+                group = spec[1]
+                point = spec[2]
+                self.table.setItem(
+                    row, 0, self._make_item(f"0x{group.fun_type:04X}")
                 )
-                self.table.setItem(row, 0, self._make_item(point.name))
-                self.table.setItem(row, 1, self._make_item(str(point.fun)))
-                self.table.setItem(row, 2, self._make_item("1 位"))
-                self.table.setItem(row, 3, self._make_item(f"{byte_value:02X}"))
-                self.table.setItem(row, 4, self._make_item(str(bit_value)))
-                self.table.setItem(row, 5, self._make_item(""))
-                self.table.setItem(row, 6, self._make_item(str(bit_value)))
-                self.table.setItem(row, 7, self._make_item(f"bit {point.inf}"))
-                continue
+                self.table.setItem(row, 1, self._make_item(point.name))
+                self.table.setItem(
+                    row, 2, self._make_item(f"0x{point.group_no:02X}")
+                )
+                self.table.setItem(
+                    row, 3, self._make_item(f"0x{point.entry_no:02X}")
+                )
+                self._add_result_combo(row, group)
+                self.table.setItem(
+                    row,
+                    5,
+                    self._make_item(
+                        f"ID={point.ied_dot}" if point.ied_dot else ""
+                    ),
+                )
+        elif kind == "YX":
+            headers = ["组", "名称", "字节", "位", "值", "说明"]
+            self._style_table(headers)
+            self.table.setRowCount(max(1, len(rows)))
+            if not rows:
+                self.table.setItem(0, 0, self._make_item("没有遥信点"))
+                self.table.setSpan(0, 0, 1, len(headers))
+            for row, spec in enumerate(rows):
+                self._row_specs.append(spec)
+                group = spec[1]
+                point = spec[2]
+                byte_value = (
+                    group.data[point.fun] if point.fun < len(group.data) else 0
+                )
+                checked = (
+                    bool((byte_value >> point.inf) & 0x01)
+                    if 0 <= point.inf < 8
+                    else False
+                )
+                self.table.setItem(
+                    row, 0, self._make_item(f"0x{group.fun_type:04X}")
+                )
+                self.table.setItem(row, 1, self._make_item(point.name))
+                self.table.setItem(row, 2, self._make_item(str(point.fun)))
+                self.table.setItem(row, 3, self._make_item(str(point.inf)))
+                item = QTableWidgetItem()
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                )
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if checked
+                    else Qt.CheckState.Unchecked
+                )
+                self.table.setItem(row, 4, item)
+                self.table.setItem(
+                    row,
+                    5,
+                    self._make_item(
+                        f"ID={point.ied_dot}" if point.ied_dot else ""
+                    ),
+                )
+        else:
+            headers = [
+                "组",
+                "名称",
+                "偏移",
+                "长度",
+                "原始值(HEX)",
+                "原始值",
+                "系数",
+                "工程值",
+                "说明",
+            ]
+            self._style_table(headers)
+            self.table.setRowCount(max(1, len(rows)))
+            if not rows:
+                self.table.setItem(0, 0, self._make_item("没有数据点"))
+                self.table.setSpan(0, 0, 1, len(headers))
+            for row, spec in enumerate(rows):
+                self._row_specs.append(spec)
+                if spec[0] == "ext":
+                    group = spec[1]
+                    start, length = spec[2]
+                    self._populate_extension_row(group, row, start, length)
+                else:
+                    group = spec[1]
+                    point = spec[2]
+                    self._populate_numeric_point_row(group, row, point)
 
-            fmt = self._format_for(point)
-            raw_bytes = self._read_point_bytes(group, point)
-            raw_hex = format_hex(raw_bytes)
-            raw_value = fmt.decode_raw(raw_bytes)
-            scale = fmt.effective_scale(point.factor)
-            engineering_value = fmt.decode_eng(raw_bytes, point.factor)
+        self.table.blockSignals(False)
+        self._apply_point_filter()
 
-            show_decimal = 0 < point.inf <= 4
-            if fmt.is_float(point.inf) and point.inf == 4:
-                raw_dec = f"{raw_value:g}"
-            elif show_decimal:
-                raw_dec = str(int(round(raw_value)))
-            else:
-                raw_dec = "-"
-            engineering = (
-                f"{engineering_value:g}" if 0 < point.inf <= 4 else "-"
-            )
+    def _populate_numeric_point_row(
+        self, group: Group, row: int, point: Point
+    ) -> None:
+        fmt = self._format_for(point)
+        raw_bytes = self._read_point_bytes(group, point)
+        raw_hex = format_hex(raw_bytes)
+        raw_value = fmt.decode_raw(raw_bytes)
+        scale = fmt.effective_scale(point.factor)
+        engineering_value = fmt.decode_eng(raw_bytes, point.factor)
 
-            note_parts = []
-            description = fmt.describe()
-            if description:
-                note_parts.append(description)
-            if point.ied_dot:
-                note_parts.append(f"ID={point.ied_dot}")
-            if point.kind == "FIX" and point.value_type:
-                note_parts.append(f"ValueType={point.value_type}")
-            note = " | ".join(note_parts)
+        show_decimal = 0 < point.inf <= 4
+        if fmt.is_float(point.inf) and point.inf == 4:
+            raw_dec = f"{raw_value:g}"
+        elif show_decimal:
+            raw_dec = str(int(round(raw_value)))
+        else:
+            raw_dec = "-"
+        engineering = f"{engineering_value:g}" if show_decimal else "-"
 
-            coefficient_editable = (
-                point.kind == "FIX"
-                and fmt.code == "auto"
-                and fmt.scale is None
-            )
+        note_parts = []
+        description = fmt.describe()
+        if description:
+            note_parts.append(description)
+        if point.ied_dot:
+            note_parts.append(f"ID={point.ied_dot}")
+        if point.kind == "FIX" and point.value_type:
+            note_parts.append(f"ValueType={point.value_type}")
 
-            self.table.setItem(row, 0, self._make_item(point.name or "(未命名)"))
-            self.table.setItem(row, 1, self._make_item(str(point.fun)))
-            self.table.setItem(row, 2, self._make_item(str(point.inf)))
-            self.table.setItem(
-                row, 3, self._make_item(raw_hex, editable=point.inf > 0)
-            )
-            self.table.setItem(row, 4, self._make_item(raw_dec, editable=show_decimal))
-            self.table.setItem(
-                row,
-                5,
-                self._make_item(f"{scale:g}", editable=coefficient_editable),
-            )
-            self.table.setItem(
-                row,
-                6,
-                self._make_item(
-                    engineering,
-                    editable=0 < point.inf <= 4,
-                ),
-            )
-            self.table.setItem(row, 7, self._make_item(note))
+        coefficient_editable = (
+            point.kind == "FIX"
+            and fmt.code == "auto"
+            and fmt.scale is None
+        )
 
-        for offset, (start, length) in enumerate(gaps, start=len(points)):
-            self._row_specs.append(("ext", (start, length)))
-            self._populate_extension_row(group, offset, start, length)
+        self.table.setItem(
+            row, 0, self._make_item(f"0x{group.fun_type:04X}")
+        )
+        self.table.setItem(row, 1, self._make_item(point.name or "(未命名)"))
+        self.table.setItem(row, 2, self._make_item(str(point.fun)))
+        self.table.setItem(row, 3, self._make_item(str(point.inf)))
+        self.table.setItem(
+            row, 4, self._make_item(raw_hex, editable=point.inf > 0)
+        )
+        self.table.setItem(row, 5, self._make_item(raw_dec, editable=show_decimal))
+        self.table.setItem(
+            row,
+            6,
+            self._make_item(f"{scale:g}", editable=coefficient_editable),
+        )
+        self.table.setItem(
+            row, 7, self._make_item(engineering, editable=show_decimal)
+        )
+        self.table.setItem(row, 8, self._make_item(" | ".join(note_parts)))
 
-    def _populate_yx(self, group: Group) -> None:
-        headers = ["名称", "字节", "位", "值", "说明"]
-        self._style_table(headers)
-        points = group.points
-        self.table.setRowCount(max(1, len(points)))
-        self._row_specs = []
-
-        if not points:
-            self.table.setItem(0, 0, self._make_item("无 XML 点定义"))
-            self.table.setSpan(0, 0, 1, len(headers))
-            return
-
-        for row, point in enumerate(points):
-            self._row_specs.append(("point", point))
-            byte_value = group.data[point.fun] if point.fun < len(group.data) else 0
-            checked = (
-                bool((byte_value >> point.inf) & 0x01)
-                if 0 <= point.inf < 8
-                else False
-            )
-            self.table.setItem(row, 0, self._make_item(point.name))
-            self.table.setItem(row, 1, self._make_item(str(point.fun)))
-            self.table.setItem(row, 2, self._make_item(str(point.inf)))
-
-            item = QTableWidgetItem()
-            item.setFlags(
-                Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-            )
-            item.setCheckState(
-                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-            )
-            self.table.setItem(row, 3, item)
-            self.table.setItem(
-                row,
-                4,
-                self._make_item(f"ID={point.ied_dot}" if point.ied_dot else ""),
-            )
-
-    def _populate_yk(self, group: Group) -> None:
-        headers = ["名称", "功能码", "子类型", "应答结果", "说明"]
-        self._style_table(headers)
-        points = group.points
-        self.table.setRowCount(max(1, len(points)))
-        self._row_specs = []
-
-        if not points:
-            self.table.setItem(0, 0, self._make_item("未定义控制"))
-            self.table.setItem(0, 1, self._make_item(f"0x{group.group_no:02X}"))
-            self.table.setItem(0, 2, self._make_item(f"0x{group.entry_no:02X}"))
-            self._add_result_combo(0, group)
-            return
-
-        for row, point in enumerate(points):
-            self._row_specs.append(("point", point))
-            self.table.setItem(row, 0, self._make_item(point.name))
-            self.table.setItem(row, 1, self._make_item(f"0x{group.group_no:02X}"))
-            self.table.setItem(row, 2, self._make_item(f"0x{group.entry_no:02X}"))
-            self._add_result_combo(row, group)
-            self.table.setItem(
-                row,
-                4,
-                self._make_item(f"ID={point.ied_dot}" if point.ied_dot else ""),
-            )
+    def _populate_extension_row(
+        self, group: Group, row: int, start: int, length: int
+    ) -> None:
+        raw = self._read_range(group, start, length)
+        raw_hex = format_hex(group.data[start : start + length])
+        show_decimal = 0 < length <= 4
+        raw_dec = str(raw) if show_decimal else "-"
+        name = "原始数据" if not group.points else "扩展字段"
+        self.table.setItem(
+            row, 0, self._make_item(f"0x{group.fun_type:04X}")
+        )
+        self.table.setItem(
+            row,
+            1,
+            self._make_item(f"{name} [{start}..{start + length - 1}]"),
+        )
+        self.table.setItem(row, 2, self._make_item(str(start)))
+        self.table.setItem(row, 3, self._make_item(str(length)))
+        self.table.setItem(row, 4, self._make_item(raw_hex, editable=True))
+        self.table.setItem(
+            row, 5, self._make_item(raw_dec, editable=show_decimal)
+        )
+        self.table.setItem(row, 6, self._make_item("1"))
+        self.table.setItem(row, 7, self._make_item(raw_dec))
+        self.table.setItem(row, 8, self._make_item("未映射字节，直接改原始值"))
 
     def _add_result_combo(self, row: int, group: Group) -> None:
         combo = QComboBox()
@@ -1619,7 +1718,7 @@ class MainWindow(QMainWindow):
         combo.currentIndexChanged.connect(
             lambda _index, g=group, c=combo: self._on_yk_result_changed(g, c)
         )
-        self.table.setCellWidget(row, 3, combo)
+        self.table.setCellWidget(row, 4, combo)
 
     def _on_yk_result_changed(self, group: Group, combo: QComboBox) -> None:
         if self._updating:
@@ -1654,20 +1753,16 @@ class MainWindow(QMainWindow):
         return True
 
     def _edit_point_format(self) -> None:
-        group = self._current_group
-        if group is None:
-            QMessageBox.information(self, "点格式", "请先选择一个组")
-            return
         row = self.table.currentRow()
         if row < 0 or row >= len(self._row_specs):
             QMessageBox.information(self, "点格式", "请先在点表里选择一个点")
             return
         spec = self._row_specs[row]
-        if spec[0] != "point" or spec[1].kind not in ("YC", "FIX"):
+        if spec[0] != "point" or spec[2].kind not in ("YC", "FIX"):
             QMessageBox.information(self, "点格式", "只有遥测/定值点可以设置数据格式")
             return
 
-        point = spec[1]
+        point = spec[2]
         dialog = PointFormatDialog(self, point, self._format_for(point))
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.result is None:
             return
@@ -1678,7 +1773,7 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self._log("ERR", f"保存点格式失败: {exc}")
 
-        self._populate_group(group)
+        self._populate_category(self.category)
         self._log(
             "INFO",
             f"点格式已更新: {point.name or '(未命名)'} -> "
@@ -1714,10 +1809,10 @@ class MainWindow(QMainWindow):
             else:
                 raw_dec = "-"
 
-            self.table.item(row, 3).setText(format_hex(raw_bytes))
-            self.table.item(row, 4).setText(raw_dec)
-            self.table.item(row, 5).setText(f"{scale:g}")
-            self.table.item(row, 6).setText(
+            self.table.item(row, 4).setText(format_hex(raw_bytes))
+            self.table.item(row, 5).setText(raw_dec)
+            self.table.item(row, 6).setText(f"{scale:g}")
+            self.table.item(row, 7).setText(
                 f"{engineering_value:g}" if 0 < point.inf <= 4 else "-"
             )
         finally:
@@ -1725,31 +1820,31 @@ class MainWindow(QMainWindow):
             self._updating = False
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._updating or self._current_group is None:
+        if self._updating:
             return
 
-        group = self._current_group
         row = item.row()
         column = item.column()
         if row < 0 or row >= len(self._row_specs):
             return
         spec = self._row_specs[row]
+        group = spec[1]
 
-        if group.kind == "YK":
+        if spec[0] == "point" and spec[2].kind == "YK":
             return
 
-        if group.kind == "YX":
-            if column != 3 or spec[0] != "point":
+        if spec[0] == "point" and spec[2].kind == "YX":
+            if column != 4:
                 return
-            point = spec[1]
+            point = spec[2]
             self._write_bit(
                 group, point, item.checkState() == Qt.CheckState.Checked
             )
             return
 
         if spec[0] == "ext":
-            start, length = spec[1]
-            if column == 3:
+            start, length = spec[2]
+            if column == 4:
                 try:
                     data = parse_hex(item.text())
                 except ValueError:
@@ -1764,7 +1859,7 @@ class MainWindow(QMainWindow):
                 if not self._write_range(group, start, length, raw):
                     self._refresh_extension_row(group, row, start, length)
                     return
-            elif column == 4:
+            elif column == 5:
                 try:
                     raw = int(item.text().strip(), 0)
                 except ValueError:
@@ -1779,13 +1874,13 @@ class MainWindow(QMainWindow):
             self._refresh_extension_row(group, row, start, length)
             return
 
-        point = spec[1]
+        point = spec[2]
         if point.kind == "YX":
             return
 
         fmt = self._format_for(point)
 
-        if column == 3:
+        if column == 4:
             try:
                 data = parse_hex(item.text())
             except ValueError:
@@ -1799,7 +1894,7 @@ class MainWindow(QMainWindow):
             if not self._write_point_bytes(group, point, data):
                 self._refresh_numeric_row(group, point, row)
                 return
-        elif column == 4:
+        elif column == 5:
             try:
                 text = item.text().strip()
                 value = float(text) if fmt.is_float(point.inf) else int(text, 0)
@@ -1811,7 +1906,7 @@ class MainWindow(QMainWindow):
             if not self._write_point_bytes(group, point, data):
                 self._refresh_numeric_row(group, point, row)
                 return
-        elif column == 5:
+        elif column == 6:
             if not (
                 point.kind == "FIX"
                 and fmt.code == "auto"
@@ -1831,7 +1926,7 @@ class MainWindow(QMainWindow):
             point.factor = value
             self._refresh_numeric_row(group, point, row)
             return
-        elif column == 6:
+        elif column == 7:
             try:
                 value = float(item.text().strip())
                 data = fmt.encode_eng(value, point.inf, point.factor)
@@ -1885,27 +1980,6 @@ class MainWindow(QMainWindow):
             gaps.append((cursor, total - cursor))
         return gaps
 
-    def _populate_extension_row(
-        self, group: Group, row: int, start: int, length: int
-    ) -> None:
-        raw = self._read_range(group, start, length)
-        raw_hex = format_hex(group.data[start : start + length])
-        show_decimal = 0 < length <= 4
-        raw_dec = str(raw) if show_decimal else "-"
-        name = "原始数据" if not group.points else "扩展字段"
-        self.table.setItem(
-            row,
-            0,
-            self._make_item(f"{name} [{start}..{start + length - 1}]"),
-        )
-        self.table.setItem(row, 1, self._make_item(str(start)))
-        self.table.setItem(row, 2, self._make_item(str(length)))
-        self.table.setItem(row, 3, self._make_item(raw_hex, editable=True))
-        self.table.setItem(row, 4, self._make_item(raw_dec, editable=show_decimal))
-        self.table.setItem(row, 5, self._make_item("1"))
-        self.table.setItem(row, 6, self._make_item(raw_dec))
-        self.table.setItem(row, 7, self._make_item("未映射字节，直接改原始值"))
-
     def _refresh_extension_row(
         self, group: Group, row: int, start: int, length: int
     ) -> None:
@@ -1915,11 +1989,11 @@ class MainWindow(QMainWindow):
             raw = self._read_range(group, start, length)
             show_decimal = 0 < length <= 4
             raw_dec = str(raw) if show_decimal else "-"
-            self.table.item(row, 3).setText(
+            self.table.item(row, 4).setText(
                 format_hex(group.data[start : start + length])
             )
-            self.table.item(row, 4).setText(raw_dec)
-            self.table.item(row, 6).setText(raw_dec)
+            self.table.item(row, 5).setText(raw_dec)
+            self.table.item(row, 7).setText(raw_dec)
         finally:
             self.table.blockSignals(False)
             self._updating = False
@@ -1951,8 +2025,7 @@ class MainWindow(QMainWindow):
         if not self.device.groups:
             return
         self.device.reset_defaults(self.templates)
-        if self._current_group is not None:
-            self._populate_group(self._current_group)
+        self._populate_category(self.category)
         self._log("INFO", "所有组已重置为模板/零值")
 
     # ------------------------------------------------------------------ misc

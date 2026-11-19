@@ -66,9 +66,14 @@ def main() -> int:
     device.apply_templates(templates)
     # 9 个 XML 组 + 1 个由 templates.json 生成的 0x1B01 组
     check(len(device.groups) == 10, f"组数 = {len(device.groups)}")
+    counts = device.point_counts()
     check(
-        sum(len(g.points) for g in device.groups.values()) == 28,
-        "点数 = 28（4 遥测 + 19 遥信 + 5 遥控）",
+        counts["YC"] == 4 and counts["YX"] == 19 and counts["YK"] == 5,
+        "遥测 4 / 遥信 19 / 遥控 5",
+    )
+    check(
+        counts["FIX"] in (0, 3),
+        f"定值点数 = {counts['FIX']}（合并表为 3）",
     )
 
     group = device.find(0x1B, 0x01)
