@@ -10,6 +10,11 @@ from pathlib import Path
 import struct
 import tempfile
 
+from app.battery_model import (
+    BatteryModel,
+    apply_snapshot,
+    role_for_point,
+)
 from app.device_model import DeviceModel, Point, format_hex, parse_hex
 from app.fault_injector import FaultConfig, FaultInjector
 from app.frame_codec import FrameCodec
@@ -17,6 +22,7 @@ from app.point_format import PointFormat
 from app.point_format_store import load_formats, point_key, save_formats
 from app.protocol_engine import ProtocolEngine
 from app.preset_store import apply_preset, collect_preset, load_preset, save_preset
+from app.scenario import apply_step, load_scenario
 from app.template_store import (
     load_templates,
     save_templates,
@@ -294,6 +300,84 @@ def main() -> int:
             == "f32be",
             "不同 XML 的点格式互不覆盖",
         )
+
+    print("== 电池模型 ==")
+    model = BatteryModel()
+    check(
+        abs(model.soc - 100.0) < 1e-6 and abs(model.voltage - 53.5) < 1e-6,
+        "初始 100% / 53.5V",
+    )
+    model.ac_present = False
+    model.tick(3600)
+    check(58.0 < model.soc < 59.0, f"放电 1 小时 SOC={model.soc:.2f}%")
+    check(not model.snapshot()["undervoltage"], "1 小时未欠压")
+    model.tick(3600)
+    check(model.snapshot()["undervoltage"], "2 小时后欠压")
+    model.reset()
+    model.phase_loss = [True, False, False]
+    snapshot = model.snapshot()
+    check(snapshot["phase_a_loss"] and not snapshot["ac_loss"], "单相失电不报交流失电")
+    model.phase_loss = [True, True, False]
+    check(model.snapshot()["ac_loss"], "两相失电报交流失电")
+    model.reset()
+    model.start_activation()
+    model.tick(600)
+    snapshot = model.snapshot()
+    check(
+        snapshot["activation"] and 9.0 < model.max_discharge_minutes < 11.0,
+        "活化放电 10 分钟",
+    )
+
+    check(
+        role_for_point(Point("YC", "电池电压", 1, 1, 0, 2))
+        == "battery_voltage",
+        "电池电压映射",
+    )
+    check(
+        role_for_point(Point("YX", "A 相失电告警信号", 1, 2, 0, 0))
+        == "phase_a_loss",
+        "A 相失电映射",
+    )
+    check(
+        role_for_point(Point("YX", "操作电压欠压告警信号", 1, 4, 1, 0))
+        is None,
+        "操作电压欠压告警不误判为遥测",
+    )
+
+    model.reset()
+    model.ac_present = False
+    model.tick(60)
+    updated, notes = apply_snapshot(device, model.snapshot())
+    check(updated > 0 and not notes, f"模型写入 {updated} 个点")
+    data_0104 = bytes(device.find(1, 4).data)
+    check((data_0104[1] & 0x05) == 0x05, "交流失电/后备投入位写入 0x0104")
+
+    print("== 场景 ==")
+    scenario_path = (
+        Path(__file__).resolve().parent / "data" / "scenario_example.json"
+    )
+    check(scenario_path.exists(), "示例场景存在")
+    scenario = load_scenario(scenario_path)
+    check(len(scenario.steps) == 6 and scenario.loop, "场景 6 步 + 循环")
+
+    scenario_device = DeviceModel()
+    scenario_device.load_xml(XML_PATH)
+    scenario_device.apply_templates(templates)
+
+    updated, notes = apply_step(scenario_device, scenario.steps[0])
+    check(updated > 0 and not notes, "场景 step0 应用")
+    check(
+        format_hex(bytes(scenario_device.find(1, 1).data)) == "D0 FC D2 F0",
+        "step0 电池/电容电压",
+    )
+    apply_step(scenario_device, scenario.steps[1])
+    check(
+        bytes(scenario_device.find(1, 2).data)[0] & 0x01 == 0x01,
+        "step1 A 相失电",
+    )
+    apply_step(scenario_device, scenario.steps[2])
+    data_0104 = bytes(scenario_device.find(1, 4).data)
+    check((data_0104[1] & 0x05) == 0x05, "step2 交流失电/后备投入")
 
     print("== XML 校验 ==")
     bad_xml = """<?xml version="1.0" encoding="GB2312"?>

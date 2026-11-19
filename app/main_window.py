@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.battery_model import BatteryModel, apply_snapshot
 from app.device_model import (
     KIND_NAMES,
     DeviceModel,
@@ -50,6 +52,7 @@ from app.point_format_dialog import PointFormatDialog
 from app.point_format_store import load_formats, point_key, save_formats
 from app.preset_store import apply_preset, load_preset, save_preset
 from app.protocol_engine import ProtocolEngine
+from app.scenario import Scenario, apply_step, load_scenario
 from app.template_dialog import TemplateDialog
 from app.template_store import load_templates
 from app.xml_check_dialog import XmlCheckDialog
@@ -75,6 +78,20 @@ class MainWindow(QMainWindow):
         self.recorded_frames: list[Frame] = []
         self._last_request: tuple[int, Frame] | None = None
         self._frame_records: list[dict] = []
+
+        self.battery_model = BatteryModel()
+        self.battery_timer = QTimer(self)
+        self.battery_timer.setInterval(1000)
+        self.battery_timer.timeout.connect(self._on_battery_tick)
+        self._battery_last_alarms: dict = {}
+        self._battery_last_state = ""
+
+        self.scenario: Scenario | None = None
+        self.scenario_timer = QTimer(self)
+        self.scenario_timer.setInterval(100)
+        self.scenario_timer.timeout.connect(self._on_scenario_tick)
+        self.scenario_start_ms = 0
+        self.scenario_index = 0
 
         self.port = QSerialPort(self)
         self._want_open = False
@@ -321,10 +338,92 @@ class MainWindow(QMainWindow):
         event_layout.addWidget(self.event_view)
         self.bottom_tabs.addTab(event_widget, "运行日志")
 
+        scenario_widget = QWidget()
+        scenario_layout = QVBoxLayout(scenario_widget)
+        scenario_layout.setContentsMargins(0, 0, 0, 0)
+
+        battery_group = QGroupBox("电池模型")
+        battery_layout = QVBoxLayout(battery_group)
+
+        battery_row1 = QHBoxLayout()
+        self.battery_start_btn = QPushButton("启动模型")
+        self.battery_stop_btn = QPushButton("停止")
+        self.battery_activation_btn = QPushButton("活化启动")
+        self.battery_activation_stop_btn = QPushButton("活化停止")
+        self.battery_reset_btn = QPushButton("重置")
+        self.battery_ac_cb = QCheckBox("交流供电")
+        self.battery_ac_cb.setChecked(True)
+        self.battery_phase_cbs = [
+            QCheckBox(text) for text in ("A相失电", "B相失电", "C相失电")
+        ]
+        battery_row1.addWidget(self.battery_start_btn)
+        battery_row1.addWidget(self.battery_stop_btn)
+        battery_row1.addSpacing(8)
+        battery_row1.addWidget(self.battery_activation_btn)
+        battery_row1.addWidget(self.battery_activation_stop_btn)
+        battery_row1.addWidget(self.battery_reset_btn)
+        battery_row1.addSpacing(12)
+        battery_row1.addWidget(self.battery_ac_cb)
+        for checkbox in self.battery_phase_cbs:
+            battery_row1.addWidget(checkbox)
+        battery_row1.addStretch(1)
+        battery_layout.addLayout(battery_row1)
+
+        battery_row2 = QHBoxLayout()
+        self.battery_load_spin = QDoubleSpinBox()
+        self.battery_load_spin.setDecimals(1)
+        self.battery_load_spin.setRange(0.0, 1000.0)
+        self.battery_load_spin.setValue(10.0)
+        self.battery_load_spin.setSuffix(" A")
+        self.battery_load_spin.setFixedWidth(110)
+        self.battery_charge_spin = QDoubleSpinBox()
+        self.battery_charge_spin.setDecimals(1)
+        self.battery_charge_spin.setRange(0.0, 1000.0)
+        self.battery_charge_spin.setValue(5.0)
+        self.battery_charge_spin.setSuffix(" A")
+        self.battery_charge_spin.setFixedWidth(110)
+        self.battery_soc_label = QLabel("SOC --")
+        self.battery_voltage_label = QLabel("电压 --")
+        self.battery_state_label = QLabel("状态 --")
+        battery_row2.addWidget(QLabel("负载电流:"))
+        battery_row2.addWidget(self.battery_load_spin)
+        battery_row2.addWidget(QLabel("充电电流:"))
+        battery_row2.addWidget(self.battery_charge_spin)
+        battery_row2.addSpacing(16)
+        battery_row2.addWidget(self.battery_soc_label)
+        battery_row2.addWidget(self.battery_voltage_label)
+        battery_row2.addWidget(self.battery_state_label)
+        battery_row2.addStretch(1)
+        battery_layout.addLayout(battery_row2)
+
+        scenario_group = QGroupBox("场景时间线")
+        scenario_inner = QVBoxLayout(scenario_group)
+        scenario_row = QHBoxLayout()
+        self.scenario_load_btn = QPushButton("加载场景...")
+        self.scenario_start_btn = QPushButton("开始")
+        self.scenario_stop_btn = QPushButton("停止")
+        self.scenario_loop_cb = QCheckBox("循环")
+        self.scenario_name_label = QLabel("未加载场景")
+        self.scenario_step_label = QLabel("步骤 0/0")
+        scenario_row.addWidget(self.scenario_load_btn)
+        scenario_row.addWidget(self.scenario_start_btn)
+        scenario_row.addWidget(self.scenario_stop_btn)
+        scenario_row.addWidget(self.scenario_loop_cb)
+        scenario_row.addSpacing(12)
+        scenario_row.addWidget(self.scenario_name_label)
+        scenario_row.addWidget(self.scenario_step_label)
+        scenario_row.addStretch(1)
+        scenario_inner.addLayout(scenario_row)
+
+        scenario_layout.addWidget(battery_group)
+        scenario_layout.addWidget(scenario_group)
+        scenario_layout.addStretch(1)
+        self.bottom_tabs.addTab(scenario_widget, "场景/电池")
+
         right = QSplitter(Qt.Orientation.Vertical)
         right.addWidget(detail)
         right.addWidget(self.bottom_tabs)
-        right.setSizes([560, 220])
+        right.setSizes([500, 280])
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left)
@@ -367,6 +466,25 @@ class MainWindow(QMainWindow):
         self.clear_record_btn.clicked.connect(self._clear_recorded)
 
         self._build_menu()
+
+        self.battery_start_btn.clicked.connect(self._start_battery)
+        self.battery_stop_btn.clicked.connect(self._stop_battery)
+        self.battery_activation_btn.clicked.connect(self._start_activation)
+        self.battery_activation_stop_btn.clicked.connect(self._stop_activation)
+        self.battery_reset_btn.clicked.connect(self._reset_battery)
+        self.battery_ac_cb.toggled.connect(self._on_battery_controls_changed)
+        for checkbox in self.battery_phase_cbs:
+            checkbox.toggled.connect(self._on_battery_controls_changed)
+        self.battery_load_spin.valueChanged.connect(self._on_battery_controls_changed)
+        self.battery_charge_spin.valueChanged.connect(
+            self._on_battery_controls_changed
+        )
+        self.scenario_load_btn.clicked.connect(self._load_scenario)
+        self.scenario_start_btn.clicked.connect(self._start_scenario)
+        self.scenario_stop_btn.clicked.connect(self._stop_scenario)
+        self._update_battery_buttons()
+        self._update_battery_labels()
+        self._update_scenario_buttons()
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
@@ -598,6 +716,27 @@ class MainWindow(QMainWindow):
             if self._current_group is not None:
                 self._populate_group(self._current_group)
 
+        if self.battery_timer.isActive():
+            if frame.func == 0x02:
+                control_group = self.device.find(0x02, frame.subtype)
+                control_name = (
+                    control_group.points[0].name
+                    if control_group and control_group.points
+                    else ""
+                )
+                if "活化启动" in control_name:
+                    self.battery_model.start_activation()
+                    self._log("MODEL", "DTU 遥控: 活化启动")
+                elif "活化停止" in control_name:
+                    self.battery_model.stop_activation()
+                    self._log("MODEL", "DTU 遥控: 活化停止")
+                elif "放电" in control_name and "停止" in control_name:
+                    self.battery_model.stop_activation()
+                    self._log("MODEL", "DTU 遥控: 停止放电")
+            elif frame.func == 0x1A and frame.subtype == 0x0C:
+                self.battery_model.reset()
+                self._log("MODEL", "DTU 遥控: 恢复出厂")
+
         response = self.engine.handle(frame)
         if response is None:
             self._log("SKIP", self.engine.last_note or "未定义请求，未应答")
@@ -725,6 +864,291 @@ class MainWindow(QMainWindow):
         else:
             self._log("INFO", "模板已保存（下次加载 XML 时生效）")
 
+    # ------------------------------------------------------ battery / scenario
+
+    def _start_battery(self) -> None:
+        if not self.device.groups:
+            QMessageBox.information(self, "电池模型", "请先加载 XML")
+            return
+        if self.scenario_timer.isActive():
+            self._stop_scenario()
+        self.battery_model.reset()
+        self._apply_battery_ui_to_model()
+        self._battery_last_alarms = {}
+        self._battery_last_state = ""
+        updated = self._apply_battery_snapshot()
+        if updated == 0:
+            self._log("WARN", "电池模型没有匹配到任何点")
+        self._update_battery_labels()
+        self._refresh_current_values()
+        self.battery_timer.start()
+        self._update_battery_buttons()
+        self._log("MODEL", "电池模型已启动")
+
+    def _stop_battery(self) -> None:
+        if not self.battery_timer.isActive():
+            return
+        self.battery_timer.stop()
+        self._update_battery_buttons()
+        self._log("MODEL", "电池模型已停止")
+
+    def _reset_battery(self) -> None:
+        self.battery_model.reset()
+        self._apply_battery_ui_to_model()
+        self._apply_battery_snapshot()
+        self._update_battery_labels()
+        self._refresh_current_values()
+        self._battery_last_alarms = {}
+        self._battery_last_state = ""
+        self._log("MODEL", "电池模型已重置")
+
+    def _start_activation(self) -> None:
+        self.battery_model.start_activation()
+        self._log("MODEL", "活化启动")
+        self._update_battery_labels()
+
+    def _stop_activation(self) -> None:
+        self.battery_model.stop_activation()
+        self._log("MODEL", "活化停止")
+        self._update_battery_labels()
+
+    def _apply_battery_ui_to_model(self) -> None:
+        self.battery_model.config.discharge_current = self.battery_load_spin.value()
+        self.battery_model.config.activation_current = self.battery_load_spin.value()
+        self.battery_model.config.charge_current = self.battery_charge_spin.value()
+        self.battery_model.ac_present = self.battery_ac_cb.isChecked()
+        self.battery_model.phase_loss = [
+            checkbox.isChecked() for checkbox in self.battery_phase_cbs
+        ]
+
+    def _on_battery_controls_changed(self, *_args) -> None:
+        self._apply_battery_ui_to_model()
+        if self.battery_timer.isActive():
+            self._apply_battery_snapshot()
+            self._update_battery_labels()
+            self._refresh_current_values()
+
+    def _on_battery_tick(self) -> None:
+        self.battery_model.tick(1.0)
+        self._apply_battery_snapshot()
+        self._update_battery_labels()
+        self._refresh_current_values()
+        self._log_battery_transitions()
+
+    def _log_battery_transitions(self) -> None:
+        snapshot = self.battery_model.snapshot()
+        labels = {
+            "ac_loss": "交流失电",
+            "undervoltage": "电池欠压",
+            "cutoff": "电池欠压切除",
+            "activation": "活化",
+            "backup_running": "后备投入",
+            "capacity_fault": "电池容量故障",
+        }
+        for key, label in labels.items():
+            value = bool(snapshot[key])
+            old = self._battery_last_alarms.get(key)
+            if old is not None and old != value:
+                self._log("MODEL", f"{label}: {'ON' if value else 'OFF'}")
+            self._battery_last_alarms[key] = value
+
+        state = self.battery_model.state_text()
+        if state != self._battery_last_state:
+            self._log("MODEL", f"状态: {state}")
+            self._battery_last_state = state
+
+    def _apply_battery_snapshot(self) -> int:
+        snapshot = self.battery_model.snapshot()
+        updated, notes = apply_snapshot(self.device, snapshot, self._formats)
+        for note in notes:
+            self._log("WARN", note)
+        return updated
+
+    def _update_battery_labels(self) -> None:
+        self.battery_soc_label.setText(f"SOC {self.battery_model.soc:.1f}%")
+        self.battery_voltage_label.setText(
+            f"电压 {self.battery_model.voltage:.2f} V"
+        )
+        self.battery_state_label.setText(
+            f"状态: {self.battery_model.state_text()}"
+        )
+
+    def _update_battery_buttons(self) -> None:
+        running = self.battery_timer.isActive()
+        self.battery_start_btn.setEnabled(not running)
+        self.battery_stop_btn.setEnabled(running)
+        self.battery_activation_btn.setEnabled(running)
+        self.battery_activation_stop_btn.setEnabled(running)
+
+    def _refresh_current_values(self) -> None:
+        group = self._current_group
+        if group is None or not self._row_specs:
+            return
+        if self.table.state() == QAbstractItemView.State.EditingState:
+            return
+
+        self._updating = True
+        self.table.blockSignals(True)
+        try:
+            for row, spec in enumerate(self._row_specs):
+                if row >= self.table.rowCount():
+                    break
+                if spec[0] == "ext":
+                    start, length = spec[1]
+                    raw = self._read_range(group, start, length)
+                    show_decimal = 0 < length <= 4
+                    raw_dec = str(raw) if show_decimal else "-"
+                    self.table.item(row, 3).setText(
+                        format_hex(group.data[start : start + length])
+                    )
+                    self.table.item(row, 4).setText(raw_dec)
+                    self.table.item(row, 6).setText(raw_dec)
+                    continue
+
+                point = spec[1]
+                if point.kind == "YX":
+                    byte_value = (
+                        group.data[point.fun] if point.fun < len(group.data) else 0
+                    )
+                    checked = (
+                        bool((byte_value >> point.inf) & 0x01)
+                        if 0 <= point.inf < 8
+                        else False
+                    )
+                    item = self.table.item(row, 3)
+                    if item is not None:
+                        item.setCheckState(
+                            Qt.CheckState.Checked
+                            if checked
+                            else Qt.CheckState.Unchecked
+                        )
+                    continue
+
+                if point.kind not in ("YC", "FIX"):
+                    continue
+                fmt = self._format_for(point)
+                raw_bytes = self._read_point_bytes(group, point)
+                raw_value = fmt.decode_raw(raw_bytes)
+                scale = fmt.effective_scale(point.factor)
+                engineering = fmt.decode_eng(raw_bytes, point.factor)
+                show_decimal = 0 < point.inf <= 4
+                if fmt.is_float(point.inf) and point.inf == 4:
+                    raw_dec = f"{raw_value:g}"
+                elif show_decimal:
+                    raw_dec = str(int(round(raw_value)))
+                else:
+                    raw_dec = "-"
+                self.table.item(row, 3).setText(format_hex(raw_bytes))
+                self.table.item(row, 4).setText(raw_dec)
+                self.table.item(row, 5).setText(f"{scale:g}")
+                self.table.item(row, 6).setText(
+                    f"{engineering:g}" if show_decimal else "-"
+                )
+        finally:
+            self.table.blockSignals(False)
+            self._updating = False
+
+    def _load_scenario(self) -> None:
+        if self.scenario_timer.isActive():
+            self._stop_scenario()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "加载场景",
+            str(self.app_dir / "data" / "scenario_example.json"),
+            "JSON (*.json);;所有文件 (*)",
+        )
+        if not path:
+            return
+        try:
+            scenario = load_scenario(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "场景加载失败", str(exc))
+            return
+
+        self.scenario = scenario
+        self.scenario_loop_cb.setChecked(scenario.loop)
+        self.scenario_name_label.setText(scenario.name)
+        self.scenario_step_label.setText(f"步骤 0/{len(scenario.steps)}")
+        self._update_scenario_buttons()
+        self._log(
+            "SCENE", f"已加载场景: {scenario.name}（{len(scenario.steps)} 步）"
+        )
+
+    def _start_scenario(self) -> None:
+        if self.scenario is None:
+            QMessageBox.information(self, "场景", "请先加载场景 JSON")
+            return
+        if not self.device.groups:
+            QMessageBox.information(self, "场景", "请先加载 XML")
+            return
+        if self.battery_timer.isActive():
+            self._stop_battery()
+
+        self.scenario.loop = self.scenario_loop_cb.isChecked()
+        self.scenario_start_ms = QDateTime.currentMSecsSinceEpoch()
+        self.scenario_index = 0
+        self.scenario_name_label.setText(self.scenario.name)
+        self.scenario_timer.start()
+        self._update_scenario_buttons()
+        self.scenario_step_label.setText(
+            f"步骤 0/{len(self.scenario.steps)}"
+        )
+        self._log("SCENE", f"场景开始: {self.scenario.name}")
+
+    def _stop_scenario(self) -> None:
+        if not self.scenario_timer.isActive():
+            return
+        self.scenario_timer.stop()
+        self._update_scenario_buttons()
+        self._log("SCENE", "场景已停止")
+
+    def _on_scenario_tick(self) -> None:
+        if self.scenario is None:
+            self._stop_scenario()
+            return
+
+        now = QDateTime.currentMSecsSinceEpoch()
+        elapsed = now - self.scenario_start_ms
+        while self.scenario_index < len(self.scenario.steps):
+            step = self.scenario.steps[self.scenario_index]
+            if elapsed < step.at_ms:
+                break
+            self._apply_scenario_step(step)
+            self.scenario_index += 1
+            self.scenario_step_label.setText(
+                f"步骤 {self.scenario_index}/{len(self.scenario.steps)}"
+            )
+
+        if self.scenario_index >= len(self.scenario.steps):
+            if self.scenario.loop:
+                self.scenario_start_ms = now
+                self.scenario_index = 0
+                self.scenario_step_label.setText(
+                    f"步骤 0/{len(self.scenario.steps)}"
+                )
+                self._log("SCENE", "场景循环重放")
+            else:
+                self.scenario_timer.stop()
+                self._update_scenario_buttons()
+                self._log("SCENE", "场景结束")
+
+    def _apply_scenario_step(self, step) -> None:
+        if step.log:
+            self._log("SCENE", step.log)
+        updated, notes = apply_step(self.device, step, self._formats)
+        for note in notes:
+            self._log("WARN", f"场景: {note}")
+        if updated == 0:
+            self._log("WARN", "场景步骤没有匹配到任何点")
+        self._refresh_current_values()
+
+    def _update_scenario_buttons(self) -> None:
+        running = self.scenario_timer.isActive()
+        self.scenario_start_btn.setEnabled(
+            self.scenario is not None and not running
+        )
+        self.scenario_stop_btn.setEnabled(running)
+
     # ------------------------------------------------------------------ xml
 
     def _choose_xml(self) -> None:
@@ -738,6 +1162,15 @@ class MainWindow(QMainWindow):
             self._load_xml_path(path)
 
     def _load_xml_path(self, path: str) -> None:
+        if self.battery_timer.isActive():
+            self.battery_timer.stop()
+            self._update_battery_buttons()
+            self._log("INFO", "加载 XML，电池模型已停止")
+        if self.scenario_timer.isActive():
+            self.scenario_timer.stop()
+            self._update_scenario_buttons()
+            self._log("INFO", "加载 XML，场景已停止")
+
         try:
             self.device.load_xml(path)
             self.templates = load_templates(self.templates_path)
@@ -1635,6 +2068,8 @@ class MainWindow(QMainWindow):
         self._save_settings()
         self._port_scan_timer.stop()
         self._reconnect_timer.stop()
+        self.battery_timer.stop()
+        self.scenario_timer.stop()
         if self.port.isOpen():
             self.port.close()
         super().closeEvent(event)
