@@ -57,6 +57,7 @@ from app.fault_injector import FaultConfig, FaultInjector
 from app.frame_codec import Frame, FrameCodec
 from app.point_format import PointFormat
 from app.point_format_dialog import PointFormatDialog
+from app.paths import app_root
 from app.point_format_store import load_formats, point_key, save_formats
 from app.preset_store import apply_preset, load_preset, save_preset
 from app.protocol_engine import ProtocolEngine
@@ -74,7 +75,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("充电机模拟器 - EB90 通用规约")
         self.resize(1180, 700)
 
-        self.app_dir = Path(__file__).resolve().parent.parent
+        self.app_dir = app_root()
         self.templates_path = self.app_dir / "data" / "templates.json"
         self.formats_path = self.app_dir / "data" / "point_formats.json"
         self.settings = QSettings("ChargerSim", "ChargerSim")
