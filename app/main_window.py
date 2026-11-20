@@ -756,6 +756,21 @@ class MainWindow(QMainWindow):
             self._defer_fix_values()
             self._populate_category(self.category)
 
+        if frame.func == 0x02:
+            control_group = self.device.find(0x02, frame.subtype)
+            if control_group is not None:
+                control_name = (
+                    control_group.points[0].name
+                    if control_group.points
+                    else ""
+                )
+                for group in self.device.groups.values():
+                    if group.kind == "YK":
+                        group.closed = group is control_group
+                if self.category == "YK":
+                    self._refresh_current_values()
+                self._log("INFO", f"收到遥控: {control_name or '未命名'}")
+
         if self.battery_timer.isActive():
             if frame.func == 0x02:
                 control_group = self.device.find(0x02, frame.subtype)
@@ -1169,6 +1184,12 @@ class MainWindow(QMainWindow):
                         self._style_yx_item(item, checked)
                     continue
 
+                if point.kind == "YK":
+                    item = self.table.item(row, 4)
+                    if item is not None:
+                        self._style_yx_item(item, group.closed)
+                    continue
+
                 if point.kind not in ("YC", "FIX"):
                     continue
                 fmt = self._format_for(point)
@@ -1467,7 +1488,7 @@ class MainWindow(QMainWindow):
         self.group_info.setText(f"共 {len(rows)} 行")
 
         if kind == "YK":
-            headers = ["组", "名称", "功能码", "子类型", "应答结果", "说明"]
+            headers = ["组", "名称", "功能码", "子类型", "值", "说明"]
             self._style_table(headers)
             self.table.setRowCount(max(1, len(rows)))
             if not rows:
@@ -1487,7 +1508,9 @@ class MainWindow(QMainWindow):
                 self.table.setItem(
                     row, 3, self._make_item(f"0x{point.entry_no:02X}")
                 )
-                self._add_result_button(row, group)
+                item = self._make_item("")
+                self._style_yx_item(item, group.closed)
+                self.table.setItem(row, 4, item)
                 self.table.setItem(
                     row,
                     5,
@@ -1677,38 +1700,6 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 6, self._make_item("1"))
         self.table.setItem(row, 7, self._make_item(raw_dec))
         self.table.setItem(row, 8, self._make_item("未映射字节，直接改原始值"))
-
-    def _add_result_button(self, row: int, group: Group) -> None:
-        button = QPushButton()
-        button.setFlat(True)
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._set_yk_button(button, group.result)
-        button.clicked.connect(
-            lambda _checked=False, g=group, b=button: self._toggle_yk(g, b)
-        )
-        self.table.setCellWidget(row, 4, button)
-
-    def _set_yk_button(self, button: QPushButton, result: int) -> None:
-        failed = result == 0x81
-        button.setText("失败" if failed else "成功")
-        button.setStyleSheet(
-            "QPushButton { border: none; background: transparent; "
-            "color: #c0392b; font-weight: bold; }"
-            if failed
-            else
-            "QPushButton { border: none; background: transparent; "
-            "color: #1e8449; }"
-        )
-
-    def _toggle_yk(self, group: Group, button: QPushButton) -> None:
-        if self._updating:
-            return
-        group.result = 0x81 if group.result == 0x01 else 0x01
-        if not group.data:
-            group.data = bytearray((group.result,))
-        else:
-            group.data[0] = group.result
-        self._set_yk_button(button, group.result)
 
     # ----------------------------------------------------------- value edits
 
