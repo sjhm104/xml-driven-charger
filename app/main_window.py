@@ -7,7 +7,7 @@ import struct
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QDateTime, QSettings, QIODevice, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -1164,11 +1164,9 @@ class MainWindow(QMainWindow):
                         if 0 <= point.inf < 8
                         else False
                     )
-                    combo = self.table.cellWidget(row, 4)
-                    if isinstance(combo, QComboBox):
-                        combo.blockSignals(True)
-                        combo.setCurrentIndex(1 if checked else 0)
-                        combo.blockSignals(False)
+                    item = self.table.item(row, 4)
+                    if item is not None:
+                        self._style_yx_item(item, checked)
                     continue
 
                 if point.kind not in ("YC", "FIX"):
@@ -1489,7 +1487,7 @@ class MainWindow(QMainWindow):
                 self.table.setItem(
                     row, 3, self._make_item(f"0x{point.entry_no:02X}")
                 )
-                self._add_result_combo(row, group)
+                self._add_result_button(row, group)
                 self.table.setItem(
                     row,
                     5,
@@ -1522,16 +1520,9 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, 1, self._make_item(point.name))
                 self.table.setItem(row, 2, self._make_item(str(point.fun)))
                 self.table.setItem(row, 3, self._make_item(str(point.inf)))
-                combo = QComboBox()
-                combo.addItem("分", 0)
-                combo.addItem("合", 1)
-                combo.setCurrentIndex(1 if checked else 0)
-                combo.currentIndexChanged.connect(
-                    lambda _index, g=group, p=point, c=combo: self._on_yx_changed(
-                        g, p, c
-                    )
-                )
-                self.table.setCellWidget(row, 4, combo)
+                item = self._make_item("")
+                self._style_yx_item(item, checked)
+                self.table.setItem(row, 4, item)
                 self.table.setItem(
                     row,
                     5,
@@ -1687,26 +1678,37 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 7, self._make_item(raw_dec))
         self.table.setItem(row, 8, self._make_item("未映射字节，直接改原始值"))
 
-    def _add_result_combo(self, row: int, group: Group) -> None:
-        combo = QComboBox()
-        combo.addItem("成功 (0x01)", 0x01)
-        combo.addItem("失败 (0x81)", 0x81)
-        index = combo.findData(group.result)
-        combo.setCurrentIndex(index if index >= 0 else 0)
-        combo.currentIndexChanged.connect(
-            lambda _index, g=group, c=combo: self._on_yk_result_changed(g, c)
+    def _add_result_button(self, row: int, group: Group) -> None:
+        button = QPushButton()
+        button.setFlat(True)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._set_yk_button(button, group.result)
+        button.clicked.connect(
+            lambda _checked=False, g=group, b=button: self._toggle_yk(g, b)
         )
-        self.table.setCellWidget(row, 4, combo)
+        self.table.setCellWidget(row, 4, button)
 
-    def _on_yk_result_changed(self, group: Group, combo: QComboBox) -> None:
+    def _set_yk_button(self, button: QPushButton, result: int) -> None:
+        failed = result == 0x81
+        button.setText("失败" if failed else "成功")
+        button.setStyleSheet(
+            "QPushButton { border: none; background: transparent; "
+            "color: #c0392b; font-weight: bold; }"
+            if failed
+            else
+            "QPushButton { border: none; background: transparent; "
+            "color: #1e8449; }"
+        )
+
+    def _toggle_yk(self, group: Group, button: QPushButton) -> None:
         if self._updating:
             return
-        value = combo.currentData()
-        group.result = int(value) if value is not None else 0x01
+        group.result = 0x81 if group.result == 0x01 else 0x01
         if not group.data:
             group.data = bytearray((group.result,))
         else:
             group.data[0] = group.result
+        self._set_yk_button(button, group.result)
 
     # ----------------------------------------------------------- value edits
 
@@ -1758,23 +1760,15 @@ class MainWindow(QMainWindow):
             f"{dialog.result.describe() or 'auto'}",
         )
 
-    def _on_yx_changed(
-        self, group: Group, point: Point, combo: QComboBox
-    ) -> None:
-        if self._updating:
-            return
-        self._write_bit(group, point, bool(combo.currentData()))
-
-    def _write_bit(self, group: Group, point: Point, checked: bool) -> None:
-        if not (0 <= point.inf < 8):
-            return
-        if point.fun >= len(group.data):
-            group.data.extend(b"\x00" * (point.fun + 1 - len(group.data)))
-        mask = 1 << point.inf
-        if checked:
-            group.data[point.fun] = (group.data[point.fun] | mask) & 0xFF
-        else:
-            group.data[point.fun] = group.data[point.fun] & (~mask & 0xFF)
+    def _style_yx_item(self, item: QTableWidgetItem, closed: bool) -> None:
+        item.setText("合" if closed else "分")
+        item.setForeground(
+            QBrush(QColor("#c0392b" if closed else "#2c3e50"))
+        )
+        font = item.font()
+        font.setBold(closed)
+        item.setFont(font)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
     def _refresh_numeric_row(self, group: Group, point: Point, row: int) -> None:
         self._updating = True
