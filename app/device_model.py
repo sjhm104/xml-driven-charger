@@ -82,6 +82,7 @@ class Group:
     points: list[Point] = field(default_factory=list)
     data: bytearray = field(default_factory=bytearray)
     result: int = 1  # 遥控/配置应答结果：0x01 成功，0x81 失败
+    read_seen: bool = True  # 定值组是否已经收到过 0x1B 读请求
 
     @property
     def key(self) -> tuple[int, int]:
@@ -205,6 +206,7 @@ class DeviceModel:
             group.data = bytearray(length)
             if group.kind == "YK" and group.data:
                 group.data[0] = group.result
+            group.read_seen = group.kind not in ("FIX", "RAW")
             group.points.sort(key=lambda p: (p.fun, p.inf, p.name))
 
     @staticmethod
@@ -263,6 +265,7 @@ class DeviceModel:
             group = self.groups.get(key)
             if group is None:
                 group = Group(group_no, entry_no, "RAW")
+                group.read_seen = False
                 self.groups[key] = group
 
             size = max(len(group.data), len(data))

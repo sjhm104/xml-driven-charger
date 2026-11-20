@@ -79,6 +79,7 @@ def main() -> int:
     group = device.find(0x1B, 0x01)
     check(group is not None, "存在 0x1B/01 定值组")
     assert group is not None
+    check(not group.read_seen, "定值组默认未读（等待 0x1B 请求）")
     check(len(group.data) == 8, f"0x1B/01 数据区长度 = {len(group.data)}")
     check(
         format_hex(bytes(group.data)) == "00 18 12 5C 00 28 00 64",

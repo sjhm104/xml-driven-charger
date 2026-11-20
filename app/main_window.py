@@ -798,6 +798,7 @@ class MainWindow(QMainWindow):
 
         if frame.func == 0x1A and frame.subtype == 0x0C:
             self.device.reset_defaults(self.templates)
+            self._defer_fix_values()
             self._populate_category(self.category)
 
         if self.battery_timer.isActive():
@@ -827,6 +828,19 @@ class MainWindow(QMainWindow):
                 self._apply_battery_snapshot(group.key)
                 self._refresh_current_values()
 
+        if frame.func == 0x1B:
+            group = self.device.find(0x1B, frame.subtype)
+            if group is not None and not group.read_seen:
+                self._apply_template_to_group(group)
+                group.read_seen = True
+                if self.category == "FIX":
+                    self._populate_category("FIX")
+        elif frame.func == 0x1A and frame.subtype != 0x0C:
+            group = self.device.find(0x1B, frame.subtype)
+            if group is not None and not group.read_seen:
+                self._apply_template_to_group(group)
+                group.read_seen = True
+
         response = self.engine.handle(frame)
         if response is None:
             self._log("SKIP", self.engine.last_note or "未定义请求，未应答")
@@ -852,8 +866,12 @@ class MainWindow(QMainWindow):
         else:
             self._send_response(fault.data)
 
-        if frame.func == 0x1A and frame.subtype != 0x0C:
-            self._populate_category(self.category)
+        if (
+            frame.func == 0x1A
+            and frame.subtype != 0x0C
+            and self.category == "FIX"
+        ):
+            self._populate_category("FIX")
 
     def _send_response(self, data: bytes) -> None:
         if not self.port.isOpen():
@@ -950,10 +968,41 @@ class MainWindow(QMainWindow):
         self.templates = dict(dialog.templates)
         if dialog.apply_now:
             self.device.reset_defaults(self.templates)
+            self._defer_fix_values()
             self._refresh_categories()
             self._log("INFO", "模板已保存并应用（所有组已按模板重置）")
         else:
             self._log("INFO", "模板已保存（下次加载 XML 时生效）")
+
+    def _defer_fix_values(self) -> None:
+        """定值组在收到 0x1B 读请求前不显示值。"""
+        for group in self.device.groups.values():
+            if group.kind in ("FIX", "RAW"):
+                group.read_seen = False
+                group.data = bytearray(len(group.data))
+
+    def _apply_template_to_group(self, group: Group) -> None:
+        for key, hex_text in self.templates.items():
+            try:
+                group_no, entry_no = DeviceModel.parse_group_key(key)
+            except ValueError:
+                continue
+            if (group_no, entry_no) != group.key:
+                continue
+            try:
+                data = parse_hex(hex_text)
+            except ValueError:
+                return
+            size = max(len(group.data), len(data))
+            new_data = bytearray(size)
+            new_data[: len(data)] = data
+            group.data = new_data
+            return
+
+    def _mark_fix_read(self) -> None:
+        for group in self.device.groups.values():
+            if group.kind in ("FIX", "RAW") and any(group.data):
+                group.read_seen = True
 
     # ------------------------------------------------------ battery / scenario
 
@@ -1139,6 +1188,12 @@ class MainWindow(QMainWindow):
                 if row >= self.table.rowCount():
                     break
                 group = spec[1]
+                if group.kind in ("FIX", "RAW") and not group.read_seen:
+                    for column in (4, 5, 6, 7):
+                        cell = self.table.item(row, column)
+                        if cell is not None:
+                            cell.setText("--")
+                    continue
                 if spec[0] == "ext":
                     start, length = spec[2]
                     raw = self._read_range(group, start, length)
@@ -1343,6 +1398,7 @@ class MainWindow(QMainWindow):
             self.device.load_xml(path)
             self.templates = load_templates(self.templates_path)
             self.device.apply_templates(self.templates)
+            self._defer_fix_values()
             self._xml_stem = Path(path).stem
             self._formats = load_formats(self.formats_path, self._xml_stem)
         except Exception as exc:  # noqa: BLE001 - 显示给用户即可
@@ -1466,6 +1522,7 @@ class MainWindow(QMainWindow):
                 )
 
         applied, skipped, notes = apply_preset(self.device, preset)
+        self._mark_fix_read()
         self._populate_category(self.category)
         self._log("INFO", f"预设已加载: 应用 {applied} 组，跳过 {skipped} 组")
         for note in notes:
@@ -1704,6 +1761,20 @@ class MainWindow(QMainWindow):
     def _populate_numeric_point_row(
         self, group: Group, row: int, point: Point
     ) -> None:
+        if group.kind == "FIX" and not group.read_seen:
+            self.table.setItem(
+                row, 0, self._make_item(f"0x{group.fun_type:04X}")
+            )
+            self.table.setItem(row, 1, self._make_item(point.name or "(未命名)"))
+            self.table.setItem(row, 2, self._make_item(str(point.fun)))
+            self.table.setItem(row, 3, self._make_item(str(point.inf)))
+            for column in (4, 5, 6, 7):
+                self.table.setItem(row, column, self._make_item("--"))
+            self.table.setItem(
+                row, 8, self._make_item("未读取（等待 0x1B 请求）")
+            )
+            return
+
         fmt = self._format_for(point)
         raw_bytes = self._read_point_bytes(group, point)
         raw_hex = format_hex(raw_bytes)
@@ -1758,11 +1829,29 @@ class MainWindow(QMainWindow):
     def _populate_extension_row(
         self, group: Group, row: int, start: int, length: int
     ) -> None:
+        name = "原始数据" if not group.points else "扩展字段"
+        if group.kind in ("FIX", "RAW") and not group.read_seen:
+            self.table.setItem(
+                row, 0, self._make_item(f"0x{group.fun_type:04X}")
+            )
+            self.table.setItem(
+                row,
+                1,
+                self._make_item(f"{name} [{start}..{start + length - 1}]"),
+            )
+            self.table.setItem(row, 2, self._make_item(str(start)))
+            self.table.setItem(row, 3, self._make_item(str(length)))
+            for column in (4, 5, 6, 7):
+                self.table.setItem(row, column, self._make_item("--"))
+            self.table.setItem(
+                row, 8, self._make_item("未读取（等待 0x1B 请求）")
+            )
+            return
+
         raw = self._read_range(group, start, length)
         raw_hex = format_hex(group.data[start : start + length])
         show_decimal = 0 < length <= 4
         raw_dec = str(raw) if show_decimal else "-"
-        name = "原始数据" if not group.points else "扩展字段"
         self.table.setItem(
             row, 0, self._make_item(f"0x{group.fun_type:04X}")
         )
@@ -1901,6 +1990,8 @@ class MainWindow(QMainWindow):
             return
         spec = self._row_specs[row]
         group = spec[1]
+        if group.kind in ("FIX", "RAW") and not group.read_seen:
+            return
 
         if spec[0] == "point" and spec[2].kind == "YK":
             return
@@ -2097,8 +2188,9 @@ class MainWindow(QMainWindow):
         if not self.device.groups:
             return
         self.device.reset_defaults(self.templates)
+        self._defer_fix_values()
         self._populate_category(self.category)
-        self._log("INFO", "所有组已重置为模板/零值")
+        self._log("INFO", "所有组已重置为模板/零值；定值等待 0x1B 读取")
 
     # ------------------------------------------------------------------ misc
 
