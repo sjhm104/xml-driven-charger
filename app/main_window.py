@@ -60,7 +60,6 @@ from app.point_format_dialog import PointFormatDialog
 from app.point_format_store import load_formats, point_key, save_formats
 from app.preset_store import apply_preset, load_preset, save_preset
 from app.protocol_engine import ProtocolEngine
-from app.scenario import Scenario, apply_step, load_scenario
 from app.template_dialog import TemplateDialog
 from app.template_store import load_templates
 from app.xml_check_dialog import XmlCheckDialog
@@ -99,12 +98,6 @@ class MainWindow(QMainWindow):
         self._battery_last_alarms: dict = {}
         self._battery_last_state = ""
 
-        self.scenario: Scenario | None = None
-        self.scenario_timer = QTimer(self)
-        self.scenario_timer.setInterval(100)
-        self.scenario_timer.timeout.connect(self._on_scenario_tick)
-        self.scenario_start_ms = 0
-        self.scenario_index = 0
 
         self.port = QSerialPort(self)
         self._want_open = False
@@ -134,11 +127,7 @@ class MainWindow(QMainWindow):
         self._set_port_open(False)
         self._port_scan_timer.start()
         self._update_counts()
-        self._log(
-            "INFO",
-            "工具启动。COM 口是电脑上的 USB-RS485 适配器；选好后点"
-            "“打开串口”，报文监视才会出现 DTU 轮询帧。",
-        )
+        self._log("INFO", "工具启动")
 
         self.port.readyRead.connect(self._on_ready_read)
         self.port.errorOccurred.connect(self._on_serial_error)
@@ -381,10 +370,6 @@ class MainWindow(QMainWindow):
         event_layout.addWidget(self.event_view)
         self.bottom_tabs.addTab(event_widget, "运行日志")
 
-        scenario_widget = QWidget()
-        scenario_layout = QVBoxLayout(scenario_widget)
-        scenario_layout.setContentsMargins(0, 0, 0, 0)
-
         battery_group = QGroupBox("电池模型")
         battery_layout = QVBoxLayout(battery_group)
         battery_layout.setSpacing(4)
@@ -448,33 +433,7 @@ class MainWindow(QMainWindow):
         self.battery_state_label = QLabel("状态 --")
         battery_layout.addWidget(self.battery_state_label)
 
-        scenario_group = QGroupBox("场景")
-        scenario_layout = QVBoxLayout(scenario_group)
-        scenario_layout.setSpacing(4)
-
-        scenario_row1 = QHBoxLayout()
-        self.scenario_load_btn = QPushButton("加载...")
-        self.scenario_start_btn = QPushButton("开始")
-        self.scenario_stop_btn = QPushButton("停止")
-        scenario_row1.addWidget(self.scenario_load_btn)
-        scenario_row1.addWidget(self.scenario_start_btn)
-        scenario_row1.addWidget(self.scenario_stop_btn)
-        scenario_layout.addLayout(scenario_row1)
-
-        scenario_row2 = QHBoxLayout()
-        self.scenario_loop_cb = QCheckBox("循环")
-        self.scenario_name_label = QLabel("未加载")
-        self.scenario_name_label.setMaximumWidth(180)
-        scenario_row2.addWidget(self.scenario_loop_cb)
-        scenario_row2.addWidget(self.scenario_name_label)
-        scenario_row2.addStretch(1)
-        scenario_layout.addLayout(scenario_row2)
-
-        self.scenario_step_label = QLabel("步骤 0/0")
-        scenario_layout.addWidget(self.scenario_step_label)
-
         left_layout.insertWidget(left_layout.count() - 1, battery_group)
-        left_layout.insertWidget(left_layout.count() - 1, scenario_group)
 
         right = QSplitter(Qt.Orientation.Vertical)
         right.addWidget(detail)
@@ -500,7 +459,7 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel("串口未打开")
         self.count_label = QLabel("RX 0 / TX 0")
-        self.sim_status_label = QLabel("电池模型: 停止 | 场景: 停止")
+        self.sim_status_label = QLabel("电池模型: 停止")
         self.statusBar().addWidget(self.status_label, 1)
         self.statusBar().addPermanentWidget(self.count_label)
         self.statusBar().addPermanentWidget(self.sim_status_label)
@@ -544,12 +503,8 @@ class MainWindow(QMainWindow):
         self.battery_charge_spin.valueChanged.connect(
             self._on_battery_controls_changed
         )
-        self.scenario_load_btn.clicked.connect(self._load_scenario)
-        self.scenario_start_btn.clicked.connect(self._start_scenario)
-        self.scenario_stop_btn.clicked.connect(self._stop_scenario)
         self._update_battery_buttons()
         self._update_battery_labels()
-        self._update_scenario_buttons()
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
@@ -670,9 +625,9 @@ class MainWindow(QMainWindow):
             )
             return True
 
-        self._log("ERR", f"打开 {name} 失败: {self.port.errorString()}")
+        self._log("ERR", "串口打开失败")
         if not silent:
-            QMessageBox.critical(self, "串口错误", self.port.errorString())
+            QMessageBox.critical(self, "串口打开失败", "串口打开失败")
         return False
 
     def _try_reconnect(self) -> None:
@@ -1004,19 +959,12 @@ class MainWindow(QMainWindow):
             if group.kind in ("FIX", "RAW") and any(group.data):
                 group.read_seen = True
 
-    # ------------------------------------------------------ battery / scenario
+    # -------------------------------------------------------------- battery
 
     def _start_battery(self) -> None:
         if not self.device.groups:
             QMessageBox.information(self, "电池模型", "请先加载 XML")
             return
-        if not self.port.isOpen():
-            self._log(
-                "WARN",
-                "串口未打开：模型只在本地运行，DTU 收不到应答",
-            )
-        if self.scenario_timer.isActive():
-            self._stop_scenario()
         self.battery_model.reset()
         self._apply_battery_ui_to_model()
         self._battery_last_alarms = {}
@@ -1216,13 +1164,11 @@ class MainWindow(QMainWindow):
                         if 0 <= point.inf < 8
                         else False
                     )
-                    item = self.table.item(row, 4)
-                    if item is not None:
-                        item.setCheckState(
-                            Qt.CheckState.Checked
-                            if checked
-                            else Qt.CheckState.Unchecked
-                        )
+                    combo = self.table.cellWidget(row, 4)
+                    if isinstance(combo, QComboBox):
+                        combo.blockSignals(True)
+                        combo.setCurrentIndex(1 if checked else 0)
+                        combo.blockSignals(False)
                     continue
 
                 if point.kind not in ("YC", "FIX"):
@@ -1249,121 +1195,11 @@ class MainWindow(QMainWindow):
             self.table.blockSignals(False)
             self._updating = False
 
-    def _load_scenario(self) -> None:
-        if self.scenario_timer.isActive():
-            self._stop_scenario()
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "加载场景",
-            str(self.app_dir / "data" / "scenario_example.json"),
-            "JSON (*.json);;所有文件 (*)",
-        )
-        if not path:
-            return
-        try:
-            scenario = load_scenario(path)
-        except (OSError, ValueError) as exc:
-            QMessageBox.critical(self, "场景加载失败", str(exc))
-            return
-
-        self.scenario = scenario
-        self.scenario_loop_cb.setChecked(scenario.loop)
-        self.scenario_name_label.setText(scenario.name)
-        self.scenario_step_label.setText(f"步骤 0/{len(scenario.steps)}")
-        self._update_scenario_buttons()
-        self._log(
-            "SCENE", f"已加载场景: {scenario.name}（{len(scenario.steps)} 步）"
-        )
-
-    def _start_scenario(self) -> None:
-        if self.scenario is None:
-            QMessageBox.information(self, "场景", "请先加载场景 JSON")
-            return
-        if not self.device.groups:
-            QMessageBox.information(self, "场景", "请先加载 XML")
-            return
-        if not self.port.isOpen():
-            self._log(
-                "WARN",
-                "串口未打开：场景只在本地运行，DTU 收不到应答",
-            )
-        if self.battery_timer.isActive():
-            self._stop_battery()
-
-        self.scenario.loop = self.scenario_loop_cb.isChecked()
-        self.scenario_start_ms = QDateTime.currentMSecsSinceEpoch()
-        self.scenario_index = 0
-        self.scenario_name_label.setText(self.scenario.name)
-        self.scenario_timer.start()
-        self._update_scenario_buttons()
-        self.scenario_step_label.setText(
-            f"步骤 0/{len(self.scenario.steps)}"
-        )
-        self._log("SCENE", f"场景开始: {self.scenario.name}")
-
-    def _stop_scenario(self) -> None:
-        if not self.scenario_timer.isActive():
-            return
-        self.scenario_timer.stop()
-        self._update_scenario_buttons()
-        self._log("SCENE", "场景已停止")
-
-    def _on_scenario_tick(self) -> None:
-        if self.scenario is None:
-            self._stop_scenario()
-            return
-
-        now = QDateTime.currentMSecsSinceEpoch()
-        elapsed = now - self.scenario_start_ms
-        while self.scenario_index < len(self.scenario.steps):
-            step = self.scenario.steps[self.scenario_index]
-            if elapsed < step.at_ms:
-                break
-            self._apply_scenario_step(step)
-            self.scenario_index += 1
-            self.scenario_step_label.setText(
-                f"步骤 {self.scenario_index}/{len(self.scenario.steps)}"
-            )
-
-        if self.scenario_index >= len(self.scenario.steps):
-            if self.scenario.loop:
-                self.scenario_start_ms = now
-                self.scenario_index = 0
-                self.scenario_step_label.setText(
-                    f"步骤 0/{len(self.scenario.steps)}"
-                )
-                self._log("SCENE", "场景循环重放")
-            else:
-                self.scenario_timer.stop()
-                self._update_scenario_buttons()
-                self._log("SCENE", "场景结束")
-
-    def _apply_scenario_step(self, step) -> None:
-        if step.log:
-            self._log("SCENE", step.log)
-        updated, notes = apply_step(self.device, step, self._formats)
-        for note in notes:
-            self._log("WARN", f"场景: {note}")
-        if updated == 0:
-            self._log("WARN", "场景步骤没有匹配到任何点")
-        self._refresh_current_values()
-
-    def _update_scenario_buttons(self) -> None:
-        running = self.scenario_timer.isActive()
-        self.scenario_start_btn.setEnabled(
-            self.scenario is not None and not running
-        )
-        self.scenario_stop_btn.setEnabled(running)
-        self._update_sim_status()
-
     def _update_sim_status(self) -> None:
         if not hasattr(self, "sim_status_label"):
             return
         battery = "运行" if self.battery_timer.isActive() else "停止"
-        scenario = "运行" if self.scenario_timer.isActive() else "停止"
-        self.sim_status_label.setText(
-            f"电池模型: {battery} | 场景: {scenario}"
-        )
+        self.sim_status_label.setText(f"电池模型: {battery}")
 
     # ------------------------------------------------------------------ xml
 
@@ -1389,10 +1225,6 @@ class MainWindow(QMainWindow):
             self.battery_timer.stop()
             self._update_battery_buttons()
             self._log("INFO", "加载 XML，电池模型已停止")
-        if self.scenario_timer.isActive():
-            self.scenario_timer.stop()
-            self._update_scenario_buttons()
-            self._log("INFO", "加载 XML，场景已停止")
 
         try:
             self.device.load_xml(path)
@@ -1429,12 +1261,6 @@ class MainWindow(QMainWindow):
             "INFO",
             f"已加载 XML: {path} | {summary} | 模板 {len(self.templates)}",
         )
-        if not self.port.isOpen():
-            self._log(
-                "WARN",
-                "串口未打开：收不到 DTU 轮询；点“打开串口”开始监听",
-            )
-
         warnings: list[str] = []
         if not self.device.groups:
             warnings.append("XML 没有任何有效组")
@@ -1569,21 +1395,9 @@ class MainWindow(QMainWindow):
     def _collect_category_rows(self, kind: str) -> list[tuple]:
         rows: list[tuple] = []
         for group in self.device.sorted_groups():
-            points = [point for point in group.points if point.kind == kind]
-            for point in points:
-                rows.append(("point", group, point))
-
-            if kind in ("YC", "FIX"):
-                if points and group.kind in ("YC", "FIX", "MIX"):
-                    for start, length in self._unmapped_ranges(group):
-                        rows.append(("ext", group, (start, length)))
-                elif (
-                    not group.points
-                    and group.kind == "RAW"
-                    and kind == "FIX"
-                ):
-                    if group.data:
-                        rows.append(("ext", group, (0, len(group.data))))
+            for point in group.points:
+                if point.kind == kind:
+                    rows.append(("point", group, point))
         return rows
 
     def _style_table(self, headers: list[str]) -> None:
@@ -1708,18 +1522,16 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, 1, self._make_item(point.name))
                 self.table.setItem(row, 2, self._make_item(str(point.fun)))
                 self.table.setItem(row, 3, self._make_item(str(point.inf)))
-                item = QTableWidgetItem()
-                item.setFlags(
-                    Qt.ItemFlag.ItemIsUserCheckable
-                    | Qt.ItemFlag.ItemIsEnabled
-                    | Qt.ItemFlag.ItemIsSelectable
+                combo = QComboBox()
+                combo.addItem("分", 0)
+                combo.addItem("合", 1)
+                combo.setCurrentIndex(1 if checked else 0)
+                combo.currentIndexChanged.connect(
+                    lambda _index, g=group, p=point, c=combo: self._on_yx_changed(
+                        g, p, c
+                    )
                 )
-                item.setCheckState(
-                    Qt.CheckState.Checked
-                    if checked
-                    else Qt.CheckState.Unchecked
-                )
-                self.table.setItem(row, 4, item)
+                self.table.setCellWidget(row, 4, combo)
                 self.table.setItem(
                     row,
                     5,
@@ -1770,8 +1582,13 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 3, self._make_item(str(point.inf)))
             for column in (4, 5, 6, 7):
                 self.table.setItem(row, column, self._make_item("--"))
+            note_parts = []
+            if point.ied_dot:
+                note_parts.append(f"ID={point.ied_dot}")
+            if point.kind == "FIX" and point.value_type:
+                note_parts.append(f"ValueType={point.value_type}")
             self.table.setItem(
-                row, 8, self._make_item("未读取（等待 0x1B 请求）")
+                row, 8, self._make_item(" | ".join(note_parts))
             )
             return
 
@@ -1941,6 +1758,13 @@ class MainWindow(QMainWindow):
             f"{dialog.result.describe() or 'auto'}",
         )
 
+    def _on_yx_changed(
+        self, group: Group, point: Point, combo: QComboBox
+    ) -> None:
+        if self._updating:
+            return
+        self._write_bit(group, point, bool(combo.currentData()))
+
     def _write_bit(self, group: Group, point: Point, checked: bool) -> None:
         if not (0 <= point.inf < 8):
             return
@@ -1994,15 +1818,6 @@ class MainWindow(QMainWindow):
             return
 
         if spec[0] == "point" and spec[2].kind == "YK":
-            return
-
-        if spec[0] == "point" and spec[2].kind == "YX":
-            if column != 4:
-                return
-            point = spec[2]
-            self._write_bit(
-                group, point, item.checkState() == Qt.CheckState.Checked
-            )
             return
 
         if spec[0] == "ext":
@@ -2321,7 +2136,6 @@ class MainWindow(QMainWindow):
         self._port_scan_timer.stop()
         self._reconnect_timer.stop()
         self.battery_timer.stop()
-        self.scenario_timer.stop()
         if self.port.isOpen():
             self.port.close()
         super().closeEvent(event)

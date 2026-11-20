@@ -25,7 +25,6 @@ from app.point_format import PointFormat
 from app.point_format_store import load_formats, point_key, save_formats
 from app.protocol_engine import ProtocolEngine
 from app.preset_store import apply_preset, collect_preset, load_preset, save_preset
-from app.scenario import apply_step, load_scenario
 from app.template_store import (
     load_templates,
     save_templates,
@@ -385,33 +384,6 @@ def main() -> int:
     check(updated > 0 and not notes, f"模型写入 {updated} 个点")
     data_0104 = bytes(device.find(1, 4).data)
     check((data_0104[1] & 0x05) == 0x05, "交流失电/后备投入位写入 0x0104")
-
-    print("== 场景 ==")
-    scenario_path = (
-        Path(__file__).resolve().parent / "data" / "scenario_example.json"
-    )
-    check(scenario_path.exists(), "示例场景存在")
-    scenario = load_scenario(scenario_path)
-    check(len(scenario.steps) == 6 and scenario.loop, "场景 6 步 + 循环")
-
-    scenario_device = DeviceModel()
-    scenario_device.load_xml(XML_PATH)
-    scenario_device.apply_templates(templates)
-
-    updated, notes = apply_step(scenario_device, scenario.steps[0])
-    check(updated > 0 and not notes, "场景 step0 应用")
-    check(
-        format_hex(bytes(scenario_device.find(1, 1).data)) == "D0 FC D2 F0",
-        "step0 电池/电容电压",
-    )
-    apply_step(scenario_device, scenario.steps[1])
-    check(
-        bytes(scenario_device.find(1, 2).data)[0] & 0x01 == 0x01,
-        "step1 A 相失电",
-    )
-    apply_step(scenario_device, scenario.steps[2])
-    data_0104 = bytes(scenario_device.find(1, 4).data)
-    check((data_0104[1] & 0x05) == 0x05, "step2 交流失电/后备投入")
 
     print("== XML 校验 ==")
     bad_xml = """<?xml version="1.0" encoding="GB2312"?>

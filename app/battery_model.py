@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import struct
 
-from app.device_model import DeviceModel, Point, parse_hex
+from app.device_model import DeviceModel, Point
 from app.point_format import PointFormat
 from app.point_format_store import point_key
 
@@ -272,28 +272,6 @@ def apply_snapshot(
             updated += 1
 
     return updated, notes
-
-
-def set_snapshot_group_data(device: DeviceModel, data: dict[str, str]) -> int:
-    """辅助：直接写整组数据区（场景步骤用）。"""
-    updated = 0
-    for key, hex_text in data.items():
-        try:
-            group_no, entry_no = DeviceModel.parse_group_key(key)
-            payload = parse_hex(hex_text)
-        except (ValueError, TypeError):
-            continue
-        group = device.find(group_no, entry_no)
-        if group is None:
-            continue
-        minimum = DeviceModel.xml_end(group)
-        if len(payload) < minimum:
-            payload += b"\x00" * (minimum - len(payload))
-        group.data = bytearray(payload)
-        if group.kind == "YK" and payload:
-            group.result = payload[0]
-        updated += 1
-    return updated
 
 
 def load_battery_config(path: str | Path) -> BatteryConfig:
