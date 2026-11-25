@@ -59,7 +59,6 @@ from app.point_format_store import load_formats, point_key, save_formats
 from app.preset_store import apply_preset, load_preset, save_preset
 from app.protocol_engine import ProtocolEngine
 from app.protocol_defaults import apply_group_defaults, defaults_for_xml
-from app.xml_check_dialog import XmlCheckDialog
 from app.xml_validator import validate_device
 
 CATEGORY_ORDER = ["YC", "YX", "YK", "FIX"]
@@ -114,8 +113,6 @@ class MainWindow(QMainWindow):
         self._current_group: Group | None = None
         self.category = "YC"
         self._row_specs: list[tuple] = []
-        self._xml_issues: list = []
-        self._xml_notes: list[str] = []
         self._rx_count = 0
         self._tx_count = 0
 
@@ -216,8 +213,6 @@ class MainWindow(QMainWindow):
         self.xml_warnings.setWordWrap(True)
         self.xml_warnings.setStyleSheet("color: #b35c00;")
         left_layout.addWidget(self.xml_warnings)
-        self.xml_check_btn = QPushButton("XML 检查...")
-        left_layout.addWidget(self.xml_check_btn)
         left_layout.addStretch(1)
 
         # 右侧：点表
@@ -385,7 +380,6 @@ class MainWindow(QMainWindow):
         self.refresh_ports_btn.clicked.connect(self._refresh_ports)
         self.open_btn.clicked.connect(self._toggle_port)
         self.xml_btn.clicked.connect(self._choose_xml)
-        self.xml_check_btn.clicked.connect(self._check_xml)
         self.reset_btn.clicked.connect(self._reset_data)
         self.auto_cb.toggled.connect(self._update_status)
         self.pause_cb.toggled.connect(self._update_status)
@@ -431,7 +425,6 @@ class MainWindow(QMainWindow):
         self.reconnect_action.toggled.connect(self.reconnect_cb.setChecked)
         tool_menu.addSeparator()
         tool_menu.addAction("点格式...", self._edit_point_format)
-        tool_menu.addAction("XML 检查...", self._check_xml)
 
     # ------------------------------------------------------------- settings
 
@@ -1110,8 +1103,6 @@ class MainWindow(QMainWindow):
             self._xml_stem = ""
             self._protocol_defaults = defaults_for_xml("")
             self._refresh_categories()
-            self._xml_issues = []
-            self._xml_notes = []
             self._set_xml_name("未加载 XML")
             self.xml_summary.setText("XML 加载失败")
             self.xml_summary.setToolTip(path)
@@ -1147,8 +1138,6 @@ class MainWindow(QMainWindow):
             self._log("WARN", warning)
 
         issues = validate_device(self.device)
-        self._xml_notes = list(warnings)
-        self._xml_issues = issues
         for issue in issues:
             tag = "ERR" if issue.level == "ERROR" else "WARN"
             self._log(tag, str(issue))
@@ -1160,18 +1149,6 @@ class MainWindow(QMainWindow):
             self.xml_warnings.setText(f"⚠ {first}{suffix}")
         else:
             self.xml_warnings.setText("")
-
-    def _check_xml(self) -> None:
-        if self.device.xml_path is None:
-            QMessageBox.information(self, "XML 检查", "请先加载 XML")
-            return
-        dialog = XmlCheckDialog(
-            self,
-            str(self.device.xml_path),
-            self._xml_notes,
-            self._xml_issues,
-        )
-        dialog.exec()
 
     def _save_preset(self) -> None:
         if not self.device.groups:
