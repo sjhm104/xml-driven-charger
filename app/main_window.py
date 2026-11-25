@@ -58,7 +58,7 @@ from app.paths import app_root
 from app.point_format_store import load_formats, point_key, save_formats
 from app.preset_store import apply_preset, load_preset, save_preset
 from app.protocol_engine import ProtocolEngine
-from app.template_store import load_templates
+from app.protocol_defaults import apply_group_defaults, defaults_for_xml
 from app.xml_check_dialog import XmlCheckDialog
 from app.xml_validator import validate_device
 
@@ -72,12 +72,11 @@ class MainWindow(QMainWindow):
         self.resize(1180, 700)
 
         self.app_dir = app_root()
-        self.templates_path = self.app_dir / "data" / "templates.json"
         self.formats_path = self.app_dir / "data" / "point_formats.json"
         self.settings = QSettings("ChargerSim", "ChargerSim")
-        self.templates = load_templates(self.templates_path)
         self._formats: dict[str, PointFormat] = {}
         self._xml_stem = ""
+        self._protocol_defaults: dict[str, float] = defaults_for_xml("")
         self.device = DeviceModel()
         self.engine = ProtocolEngine(self.device)
         self.address = 1
@@ -190,7 +189,7 @@ class MainWindow(QMainWindow):
         self.pause_cb.setVisible(False)
         self.reset_btn = QPushButton("重置数据")
         self.reset_btn.setToolTip(
-            "所有组重置为模板/零值；定值等待下一次 0x1B 读取"
+            "所有组重置为协议默认值/零值；定值等待下一次 0x1B 读取"
         )
         self.reset_btn.setVisible(False)
         top.addStretch(1)
@@ -629,7 +628,7 @@ class MainWindow(QMainWindow):
             return
 
         if frame.func == 0x1A and frame.subtype == 0x0C:
-            self.device.reset_defaults(self.templates)
+            self.device.reset_defaults()
             self._defer_fix_values()
             self._reset_model_protocol_settings()
             self._sync_model_from_point_values(
@@ -677,7 +676,7 @@ class MainWindow(QMainWindow):
             group = self.device.find(0x1B, frame.subtype)
             if group is not None:
                 if not group.read_seen:
-                    self._apply_template_to_group(group)
+                    self._apply_protocol_defaults_to_group(group)
                     self._apply_configured_point_values(group.key)
                     group.read_seen = True
                 if self.category == "FIX":
@@ -685,7 +684,7 @@ class MainWindow(QMainWindow):
         elif frame.func == 0x1A and frame.subtype != 0x0C:
             group = self.device.find(0x1B, frame.subtype)
             if group is not None and not group.read_seen:
-                self._apply_template_to_group(group)
+                self._apply_protocol_defaults_to_group(group)
                 self._apply_configured_point_values(group.key)
                 group.read_seen = True
 
@@ -741,48 +740,13 @@ class MainWindow(QMainWindow):
                 group.read_seen = False
                 group.data = bytearray(len(group.data))
 
-    def _apply_template_to_group(self, group: Group) -> None:
-        for key, hex_text in self.templates.items():
-            try:
-                group_no, entry_no = DeviceModel.parse_group_key(key)
-            except ValueError:
-                continue
-            if (group_no, entry_no) != group.key:
-                continue
-            try:
-                data = parse_hex(hex_text)
-            except ValueError:
-                return
-            size = max(len(group.data), len(data))
-            new_data = bytearray(size)
-            new_data[: len(data)] = data
-            group.data = new_data
-            return
-
-    def _template_bytes_for_group(self, group: Group) -> bytearray:
-        size = max(1, len(group.data))
-        for key, hex_text in self.templates.items():
-            try:
-                group_no, entry_no = DeviceModel.parse_group_key(key)
-            except ValueError:
-                continue
-            if (group_no, entry_no) != group.key:
-                continue
-            try:
-                data = parse_hex(hex_text)
-            except ValueError:
-                break
-            size = max(size, len(data))
-            result = bytearray(size)
-            result[: len(data)] = data
-            return result
-        return bytearray(size)
+    def _apply_protocol_defaults_to_group(self, group: Group) -> None:
+        apply_group_defaults(group, self._protocol_defaults, self._formats)
 
     def _battery_default_values(self) -> dict[str, float]:
         snapshot = self.battery_model.snapshot()
         defaults: dict[str, float] = {}
         for group in self.device.groups.values():
-            template = self._template_bytes_for_group(group)
             for point in group.points:
                 if point.kind not in ("YC", "FIX") or point.inf <= 0:
                     continue
@@ -792,17 +756,24 @@ class MainWindow(QMainWindow):
                     if role is not None and role in snapshot:
                         defaults[key] = float(snapshot[role])
                         continue
-                    source = group.data
-                else:
-                    source = template
+                    raw = group.data[point.fun : point.fun + point.inf]
+                    if len(raw) < point.inf:
+                        raw += b"\x00" * (point.inf - len(raw))
+                    try:
+                        defaults[key] = self._format_for(point).decode_eng(
+                            raw, point.factor
+                        )
+                    except (ValueError, OverflowError, struct.error):
+                        continue
+                    continue
 
-                raw = source[point.fun : point.fun + point.inf]
-                if len(raw) < point.inf:
-                    raw += b"\x00" * (point.inf - len(raw))
+                raw_default = self._protocol_defaults.get(point.name)
+                if raw_default is None:
+                    continue
+                fmt = self._format_for(point)
                 try:
-                    defaults[key] = self._format_for(point).decode_eng(
-                        raw, point.factor
-                    )
+                    raw = fmt.encode_raw(raw_default, point.inf)
+                    defaults[key] = fmt.decode_eng(raw, point.factor)
                 except (ValueError, OverflowError, struct.error):
                     continue
         return defaults
@@ -883,15 +854,15 @@ class MainWindow(QMainWindow):
         if "电池容量" in name and "剩余" not in name and "故障" not in name:
             config.capacity_ah = max(0.1, value)
         elif "活化放电截止电压" in name or "寿命监测放电截止电压" in name:
-            config.cutoff = value
+            config.cutoff = value / 100.0 if value > 100 else value
         elif "剩余报警容量" in name:
             config.capacity_fault_soc = max(0.0, min(100.0, value))
         elif "充电电压" in name:
-            config.charge_voltage = value
+            config.charge_voltage = value / 100.0 if value > 100 else value
         elif "浮充电压" in name:
-            config.float_voltage = value
+            config.float_voltage = value / 100.0 if value > 100 else value
         elif "电池欠压告警" in name or "欠压告警值" in name:
-            config.undervoltage = value
+            config.undervoltage = value / 100.0 if value > 100 else value
 
     def _sync_model_from_point_values(
         self, point_values: dict[str, float]
@@ -901,6 +872,8 @@ class MainWindow(QMainWindow):
                 if point.kind != "FIX":
                     continue
                 value = point_values.get(point_key(point))
+                if value is None:
+                    value = self._protocol_defaults.get(point.name)
                 if value is not None:
                     self._apply_model_setting(point.name, value)
 
@@ -1118,10 +1091,9 @@ class MainWindow(QMainWindow):
     def _load_xml_path(self, path: str) -> None:
         try:
             self.device.load_xml(path)
-            self.templates = load_templates(self.templates_path)
-            self.device.apply_templates(self.templates)
             self._defer_fix_values()
             self._xml_stem = Path(path).stem
+            self._protocol_defaults = defaults_for_xml(self._xml_stem)
             self._formats = load_formats(self.formats_path, self._xml_stem)
             self._reset_model_protocol_settings()
             self._sync_model_from_point_values(
@@ -1131,6 +1103,7 @@ class MainWindow(QMainWindow):
             self.device.clear()
             self._formats = {}
             self._xml_stem = ""
+            self._protocol_defaults = defaults_for_xml("")
             self._refresh_categories()
             self._xml_issues = []
             self._xml_notes = []
@@ -1153,7 +1126,7 @@ class MainWindow(QMainWindow):
         self.xml_summary.setToolTip(path)
         self._log(
             "INFO",
-            f"已加载 XML: {path} | {summary} | 模板 {len(self.templates)}",
+            f"已加载 XML: {path} | {summary}",
         )
         warnings: list[str] = []
         if not self.device.groups:
@@ -1862,10 +1835,10 @@ class MainWindow(QMainWindow):
     def _reset_data(self) -> None:
         if not self.device.groups:
             return
-        self.device.reset_defaults(self.templates)
+        self.device.reset_defaults()
         self._defer_fix_values()
         self._populate_category(self.category)
-        self._log("INFO", "所有组已重置为模板/零值；定值等待 0x1B 读取")
+        self._log("INFO", "所有组已重置为协议默认值/零值；定值等待 0x1B 读取")
 
     # ------------------------------------------------------------------ misc
 

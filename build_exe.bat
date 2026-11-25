@@ -1,40 +1,39 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul
 cd /d %~dp0
 
 if not exist .venv\Scripts\python.exe (
-    echo [é”™è¯¯] æœªæ‰¾åˆ° .venvï¼Œè¯·å…ˆåˆ›å»ºè™šæ‹Ÿç¯å¢ƒå¹¶å®‰è£… PySide6ã€‚
+    echo [´íÎó] Î´ÕÒµ½ .venv£¬ÇëÏÈ´´½¨ĞéÄâ»·¾³²¢°²×° PySide6¡£
     pause
     exit /b 1
 )
 
-echo [1/3] å®‰è£…/æ›´æ–° PyInstaller...
+echo [1/3] °²×°/¸üĞÂ PyInstaller...
 .venv\Scripts\python.exe -m pip install --upgrade pyinstaller
 if errorlevel 1 (
-    echo [é”™è¯¯] PyInstaller å®‰è£…å¤±è´¥ã€‚
+    echo [´íÎó] PyInstaller °²×°Ê§°Ü¡£
     pause
     exit /b 1
 )
 
-echo [2/3] æ¸…ç†æ—§æ„å»º...
+echo [2/3] ÇåÀí¾É¹¹½¨...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
-echo [3/3] æ‰“åŒ… one-folder ç‰ˆæœ¬...
+echo [3/3] ´ò°ü one-folder °æ±¾...
 .venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --noupx --name ChargerSim --paths . app\main.py
 if errorlevel 1 (
-    echo [é”™è¯¯] æ‰“åŒ…å¤±è´¥ã€‚
+    echo [´íÎó] ´ò°üÊ§°Ü¡£
     pause
     exit /b 1
 )
 
 if not exist dist\ChargerSim\data mkdir dist\ChargerSim\data
-copy /Y data\templates.json dist\ChargerSim\data\templates.json >nul
 copy /Y README.md dist\ChargerSim\README.md >nul
 
 echo.
-echo æ‰“åŒ…å®Œæˆï¼š
-echo   ç›®å½•ï¼šdist\ChargerSim
-echo   ç¨‹åºï¼šdist\ChargerSim\ChargerSim.exe
+echo ´ò°üÍê³É£º
+echo   Ä¿Â¼£ºdist\ChargerSim
+echo   ³ÌĞò£ºdist\ChargerSim\ChargerSim.exe
 echo.
 pause

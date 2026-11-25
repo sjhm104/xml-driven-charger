@@ -24,7 +24,7 @@ KIND_NAMES = {
     "YK": "遥控",
     "FIX": "定值",
     "MIX": "混合",
-    "RAW": "模板",
+    "RAW": "原始数据",
 }
 
 
@@ -254,34 +254,10 @@ class DeviceModel:
         value = int(s, 16)
         return (value >> 8) & 0xFF, value & 0xFF
 
-    def apply_templates(self, templates: dict[str, str]) -> None:
-        for key_text, hex_text in templates.items():
-            try:
-                group_no, entry_no = self.parse_group_key(key_text)
-                data = parse_hex(hex_text)
-            except (ValueError, TypeError):
-                continue
-
-            key = (group_no, entry_no)
-            group = self.groups.get(key)
-            if group is None:
-                group = Group(group_no, entry_no, "RAW")
-                group.read_seen = False
-                self.groups[key] = group
-
-            size = max(len(group.data), len(data))
-            new_data = bytearray(size)
-            new_data[: len(group.data)] = group.data
-            new_data[: len(data)] = data
-            group.data = new_data
-            if group.kind == "YK" and data:
-                group.result = data[0]
-
-    def reset_defaults(self, templates: dict[str, str]) -> None:
+    def reset_defaults(self) -> None:
         for group in self.groups.values():
             group.data = bytearray(len(group.data))
             group.result = 1
             group.closed = False
             if group.kind == "YK" and group.data:
                 group.data[0] = 1
-        self.apply_templates(templates)

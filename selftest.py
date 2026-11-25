@@ -25,19 +25,14 @@ from app.frame_codec import FrameCodec
 from app.point_format import PointFormat
 from app.point_format_store import load_formats, point_key, save_formats
 from app.protocol_engine import ProtocolEngine
+from app.protocol_defaults import apply_group_defaults, defaults_for_xml
 from app.preset_store import apply_preset, collect_preset, load_preset, save_preset
-from app.template_store import (
-    load_templates,
-    save_templates,
-    template_key_for_frame,
-)
 from app.xml_validator import validate_device
 
 XML_PATH = Path(r"E:\充电机\充电机参考装置类型表\DMP2219_Pow_CQ1000WTJND.xml")
 FIX_XML_PATH = Path(
     r"E:\充电机\增加定值读写\备份\mnt\Config\IEDDefine\WTJND.xml"
 )
-TEMPLATES_PATH = Path(__file__).resolve().parent / "data" / "templates.json"
 
 # 用户用实物抓到的 5 组 0x1B01 报文（第 2/4/5 组与第 1/3 组重复）
 REAL_READ_FRAMES = [
@@ -62,9 +57,7 @@ def main() -> int:
     check(XML_PATH.exists(), f"XML 存在: {XML_PATH}")
     device = DeviceModel()
     device.load_xml(XML_PATH)
-    templates = load_templates(TEMPLATES_PATH)
-    device.apply_templates(templates)
-    # 9 个 XML 组 + 1 个由 templates.json 生成的 0x1B01 组
+    protocol_defaults = defaults_for_xml(XML_PATH.stem)
     check(len(device.groups) == 10, f"组数 = {len(device.groups)}")
     counts = device.point_counts()
     check(
@@ -80,10 +73,11 @@ def main() -> int:
     check(group is not None, "存在 0x1B/01 定值组")
     assert group is not None
     check(not group.read_seen, "定值组默认未读（等待 0x1B 请求）")
+    apply_group_defaults(group, protocol_defaults)
     check(len(group.data) == 8, f"0x1B/01 数据区长度 = {len(group.data)}")
     check(
-        format_hex(bytes(group.data)) == "00 18 12 5C 00 28 00 64",
-        "模板初始化为 24AH / 47.00V / 40% / 100%",
+        format_hex(bytes(group.data)) == "00 18 12 5C 00 00 00 64",
+        "协议默认值为 24AH / 47.00V / 不报警 / 100%",
     )
 
     print("== 回放 5 组真实 0x1B01 响应 ==")
@@ -169,14 +163,23 @@ def main() -> int:
             == ["电池容量", "活化放电截止电压", "电池剩余报警容量"],
             "定值点名称正确",
         )
-        fix_device.apply_templates(templates)
-        check(len(fix_group.data) == 8, "模板把数据区扩展到 8 字节（含剩余容量）")
+        fix_defaults = defaults_for_xml(FIX_XML_PATH.stem)
+        apply_group_defaults(fix_group, fix_defaults)
+        check(
+            len(fix_group.data) == 8,
+            "协议默认值补齐为 8 字节（含剩余容量）",
+        )
         fix_engine = ProtocolEngine(fix_device)
         response = fix_engine.handle(request)
         assert response is not None
         check(
-            format_hex(response) == REAL_READ_FRAMES[0],
-            "WTJND.xml + 模板 回出的 0x1B01 与实物帧一致",
+            format_hex(response)
+            == format_hex(
+                FrameCodec.build(
+                    1, 0x1B, 0x01, parse_hex("00 18 12 5C 00 00 00 64")
+                )
+            ),
+            "WTJND.xml 回出协议默认 0x1B01",
         )
     else:
         print(f"  SKIP 未找到 {FIX_XML_PATH}")
@@ -215,7 +218,7 @@ def main() -> int:
     result = injector.apply(base, FaultConfig(delay_ms=200), 1)
     check(result.delay_ms == 200, "延迟参数")
 
-    print("== 模板键/存储 ==")
+    print("== 组键解析 ==")
     check(DeviceModel.parse_group_key("27/1") == (0x1B, 0x01), "27/1 按十进制解析")
     check(
         DeviceModel.parse_group_key("1B/01") == (0x1B, 0x01),
@@ -225,23 +228,6 @@ def main() -> int:
         DeviceModel.parse_group_key("0x1B/0x01") == (0x1B, 0x01),
         "0x1B/0x01 按十六进制解析",
     )
-    response_frame = FrameCodec.extract(
-        bytearray(parse_hex(REAL_READ_FRAMES[0]))
-    )[0]
-    check(template_key_for_frame(response_frame) == "0x1B01", "0x1B 响应映射为 0x1B01")
-    with tempfile.TemporaryDirectory() as temp_dir:
-        template_path = Path(temp_dir) / "templates.json"
-        save_templates(
-            template_path,
-            {"0x1B02": "00 5A 08 66", "0x1B01": "00 18 12 5C"},
-        )
-        check(
-            load_templates(template_path)
-            == {"0x1B01": "00 18 12 5C", "0x1B02": "00 5A 08 66"},
-            "模板保存/加载",
-        )
-        template_path.write_text("{}", encoding="utf-8")
-        check(load_templates(template_path) == {}, "空模板文件返回空字典")
 
     print("== 预设 ==")
     preset = collect_preset(device)
@@ -442,8 +428,11 @@ def main() -> int:
         multi_device = DeviceModel()
         multi_device.load_xml(multi_path)
         check(len(multi_device.groups) == 2, "合成 XML 有 2 个定值组")
-        multi_device.apply_templates(
-            {"0x1B01": "00 18 12 5C", "0x1B02": "00 5A 08 66"}
+        multi_device.find(0x1B, 0x01).data = bytearray(
+            parse_hex("00 18 12 5C")
+        )
+        multi_device.find(0x1B, 0x02).data = bytearray(
+            parse_hex("00 5A 08 66")
         )
         multi_engine = ProtocolEngine(multi_device)
 
