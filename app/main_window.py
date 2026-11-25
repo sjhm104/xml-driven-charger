@@ -72,7 +72,12 @@ class MainWindow(QMainWindow):
         self.resize(1180, 700)
 
         self.app_dir = app_root()
-        self.formats_path = self.app_dir / "data" / "point_formats.json"
+        self.data_dir = self.app_dir / "data"
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self.formats_path = self.data_dir / "point_formats.json"
         self.settings = QSettings("ChargerSim", "ChargerSim")
         self._formats: dict[str, PointFormat] = {}
         self._xml_stem = ""
@@ -82,7 +87,7 @@ class MainWindow(QMainWindow):
         self.address = 1
         self._frame_records: list[dict] = []
 
-        self.battery_config_path = self.app_dir / "data" / "battery_config.json"
+        self.battery_config_path = self.data_dir / "battery_config.json"
         self.battery_model = BatteryModel(
             load_battery_config(self.battery_config_path)
         )
@@ -1175,7 +1180,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "保存预设",
-            str(self.app_dir / "data" / "preset.json"),
+            str(self.data_dir / "preset.json"),
             "JSON (*.json)",
         )
         if not path:
@@ -1194,7 +1199,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "加载预设",
-            str(self.app_dir / "data"),
+            str(self.data_dir),
             "JSON (*.json);;所有文件 (*)",
         )
         if not path:
@@ -1920,7 +1925,7 @@ class MainWindow(QMainWindow):
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "导出报文",
-            str(self.app_dir / "data" / "frames.txt"),
+            str(self.data_dir / "frames.txt"),
             "文本文件 (*.txt);;Markdown (*.md)",
         )
         if not path:
@@ -1999,7 +2004,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "导出运行日志",
-            str(self.app_dir / "data" / "events.txt"),
+            str(self.data_dir / "events.txt"),
             "文本 (*.txt)",
         )
         if not path:

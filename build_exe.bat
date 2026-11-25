@@ -28,7 +28,6 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist dist\ChargerSim\data mkdir dist\ChargerSim\data
 copy /Y README.md dist\ChargerSim\README.md >nul
 
 echo.
