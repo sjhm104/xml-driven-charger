@@ -631,6 +631,10 @@ class MainWindow(QMainWindow):
         if frame.func == 0x1A and frame.subtype == 0x0C:
             self.device.reset_defaults(self.templates)
             self._defer_fix_values()
+            self._reset_model_protocol_settings()
+            self._sync_model_from_point_values(
+                self.battery_model.config.point_values
+            )
             self.battery_model.reset()
             self._apply_battery_ui_to_model()
             self._update_battery_labels()
@@ -695,6 +699,13 @@ class MainWindow(QMainWindow):
 
         self._send_response(response)
 
+        if frame.func == 0x1B or (
+            frame.func == 0x1A and frame.subtype != 0x0C
+        ):
+            fix_group = self.device.find(0x1B, frame.subtype)
+            if fix_group is not None and fix_group.read_seen:
+                self._sync_model_from_group(fix_group)
+
         if (
             frame.func == 0x1A
             and frame.subtype != 0x0C
@@ -748,6 +759,54 @@ class MainWindow(QMainWindow):
             group.data = new_data
             return
 
+    def _template_bytes_for_group(self, group: Group) -> bytearray:
+        size = max(1, len(group.data))
+        for key, hex_text in self.templates.items():
+            try:
+                group_no, entry_no = DeviceModel.parse_group_key(key)
+            except ValueError:
+                continue
+            if (group_no, entry_no) != group.key:
+                continue
+            try:
+                data = parse_hex(hex_text)
+            except ValueError:
+                break
+            size = max(size, len(data))
+            result = bytearray(size)
+            result[: len(data)] = data
+            return result
+        return bytearray(size)
+
+    def _battery_default_values(self) -> dict[str, float]:
+        snapshot = self.battery_model.snapshot()
+        defaults: dict[str, float] = {}
+        for group in self.device.groups.values():
+            template = self._template_bytes_for_group(group)
+            for point in group.points:
+                if point.kind not in ("YC", "FIX") or point.inf <= 0:
+                    continue
+                key = point_key(point)
+                if point.kind == "YC":
+                    role = role_for_point(point)
+                    if role is not None and role in snapshot:
+                        defaults[key] = float(snapshot[role])
+                        continue
+                    source = group.data
+                else:
+                    source = template
+
+                raw = source[point.fun : point.fun + point.inf]
+                if len(raw) < point.inf:
+                    raw += b"\x00" * (point.inf - len(raw))
+                try:
+                    defaults[key] = self._format_for(point).decode_eng(
+                        raw, point.factor
+                    )
+                except (ValueError, OverflowError, struct.error):
+                    continue
+        return defaults
+
     def _mark_fix_read(self) -> None:
         for group in self.device.groups.values():
             if group.kind in ("FIX", "RAW") and any(group.data):
@@ -761,7 +820,7 @@ class MainWindow(QMainWindow):
             self,
             self.battery_model.config,
             self.device,
-            self._formats,
+            self._battery_default_values(),
         )
         if (
             dialog.exec() != QDialog.DialogCode.Accepted
@@ -777,6 +836,8 @@ class MainWindow(QMainWindow):
         }
 
         self.battery_model.config = dialog.result_config
+        self._reset_model_protocol_settings()
+        self._sync_model_from_point_values(new_values)
         try:
             save_battery_config(self.battery_config_path, dialog.result_config)
         except OSError as exc:
@@ -805,6 +866,56 @@ class MainWindow(QMainWindow):
             if any(point_key(point) in keys for point in group.points):
                 group.read_seen = False
                 group.data = bytearray(len(group.data))
+
+    def _reset_model_protocol_settings(self) -> None:
+        config = self.battery_model.config
+        config.capacity_ah = 24.0
+        config.float_voltage = 53.5
+        config.charge_voltage = 57.0
+        config.empty_voltage = 42.0
+        config.undervoltage = 46.0
+        config.cutoff = 43.2
+        config.capacity_fault_soc = 5.0
+
+    def _apply_model_setting(self, name: str, value: float) -> None:
+        """用协议里的定值点驱动内部电池模型，不额外暴露模型参数。"""
+        config = self.battery_model.config
+        if "电池容量" in name and "剩余" not in name and "故障" not in name:
+            config.capacity_ah = max(0.1, value)
+        elif "活化放电截止电压" in name or "寿命监测放电截止电压" in name:
+            config.cutoff = value
+        elif "剩余报警容量" in name:
+            config.capacity_fault_soc = max(0.0, min(100.0, value))
+        elif "充电电压" in name:
+            config.charge_voltage = value
+        elif "浮充电压" in name:
+            config.float_voltage = value
+        elif "电池欠压告警" in name or "欠压告警值" in name:
+            config.undervoltage = value
+
+    def _sync_model_from_point_values(
+        self, point_values: dict[str, float]
+    ) -> None:
+        for group in self.device.groups.values():
+            for point in group.points:
+                if point.kind != "FIX":
+                    continue
+                value = point_values.get(point_key(point))
+                if value is not None:
+                    self._apply_model_setting(point.name, value)
+
+    def _sync_model_from_group(self, group: Group) -> None:
+        if group.kind != "FIX":
+            return
+        for point in group.points:
+            if point.kind != "FIX" or point.inf <= 0:
+                continue
+            raw = self._read_point_bytes(group, point)
+            try:
+                value = self._format_for(point).decode_eng(raw, point.factor)
+            except (ValueError, OverflowError, struct.error):
+                continue
+            self._apply_model_setting(point.name, value)
 
     def _apply_battery_ui_to_model(self) -> None:
         self.battery_model.ac_present = self.battery_ac_cb.isChecked()
@@ -1012,6 +1123,10 @@ class MainWindow(QMainWindow):
             self._defer_fix_values()
             self._xml_stem = Path(path).stem
             self._formats = load_formats(self.formats_path, self._xml_stem)
+            self._reset_model_protocol_settings()
+            self._sync_model_from_point_values(
+                self.battery_model.config.point_values
+            )
         except Exception as exc:  # noqa: BLE001 - 显示给用户即可
             self.device.clear()
             self._formats = {}

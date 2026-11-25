@@ -6,7 +6,7 @@ apply_snapshot() 负责把状态写到 XML 点表对应的数据区。
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import struct
@@ -18,6 +18,7 @@ from app.point_format_store import point_key
 
 @dataclass
 class BatteryConfig:
+    # 以下字段只作为内部模拟默认值，不出现在“电池参数”页，也不写入配置文件。
     capacity_ah: float = 24.0
     initial_soc: float = 100.0
     discharge_current: float = 10.0
@@ -326,6 +327,7 @@ def apply_snapshot(
 
 
 def load_battery_config(path: str | Path) -> BatteryConfig:
+    """只读取点值配置；旧的模型参数不再使用。"""
     path = Path(path)
     if not path.exists():
         return BatteryConfig()
@@ -336,36 +338,27 @@ def load_battery_config(path: str | Path) -> BatteryConfig:
     if not isinstance(obj, dict):
         return BatteryConfig()
 
-    allowed = {item.name for item in fields(BatteryConfig)}
-    kwargs: dict[str, object] = {}
-    for key, value in obj.items():
-        if key not in allowed:
-            continue
-        if key == "point_values":
-            if not isinstance(value, dict):
-                continue
-            parsed: dict[str, float] = {}
-            for point_key_text, point_value in value.items():
-                try:
-                    parsed[str(point_key_text)] = float(point_value)
-                except (TypeError, ValueError):
-                    continue
-            kwargs[key] = parsed
-            continue
+    raw_values = obj.get("point_values")
+    if not isinstance(raw_values, dict):
+        return BatteryConfig()
+    point_values: dict[str, float] = {}
+    for key, value in raw_values.items():
         try:
-            kwargs[key] = float(value)
+            point_values[str(key)] = float(value)
         except (TypeError, ValueError):
             continue
-    try:
-        return BatteryConfig(**kwargs)
-    except TypeError:
-        return BatteryConfig()
+    return BatteryConfig(point_values=point_values)
 
 
 def save_battery_config(path: str | Path, config: BatteryConfig) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(asdict(config), ensure_ascii=False, indent=2) + "\n",
+        json.dumps(
+            {"point_values": config.point_values},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )

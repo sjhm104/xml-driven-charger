@@ -342,27 +342,16 @@ def main() -> int:
         yc_group = device.find(1, 1)
         assert yc_group is not None and yc_group.points
         point_value_key = point_key(yc_group.points[0])
-        custom = BatteryConfig(
-            capacity_ah=40.0,
-            initial_soc=80.0,
-            float_voltage=54.0,
-            charge_voltage=58.0,
-            empty_voltage=43.0,
-            undervoltage=47.0,
-            cutoff=44.0,
-            point_values={point_value_key: 48.0},
-        )
+        custom = BatteryConfig(point_values={point_value_key: 48.0})
         save_battery_config(config_path, custom)
         loaded = load_battery_config(config_path)
         check(
-            loaded.capacity_ah == 40.0
-            and loaded.initial_soc == 80.0
-            and loaded.undervoltage == 47.0,
-            "电池参数保存/加载",
+            loaded.point_values.get(point_value_key) == 48.0,
+            "电池参数只保存点值配置",
         )
         check(
-            loaded.point_values.get(point_value_key) == 48.0,
-            "点值配置保存/加载",
+            loaded.capacity_ah == 24.0,
+            "旧模型参数不写入配置文件",
         )
         config_path.write_text("not json", encoding="utf-8")
         check(
