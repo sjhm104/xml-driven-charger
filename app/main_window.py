@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import csv
 import struct
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QDateTime, QSettings, QIODevice, QTimer
-from PySide6.QtGui import QBrush, QColor, QFont
+from PySide6.QtGui import QBrush, QColor, QFont, QTextCharFormat, QTextCursor
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
-    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -28,7 +26,6 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
-    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -39,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from app.battery_model import (
     BatteryModel,
+    apply_point_values,
     apply_snapshot,
     load_battery_config,
     role_for_point,
@@ -53,7 +51,6 @@ from app.device_model import (
     format_hex,
     parse_hex,
 )
-from app.fault_injector import FaultConfig, FaultInjector
 from app.frame_codec import Frame, FrameCodec
 from app.point_format import PointFormat
 from app.point_format_dialog import PointFormatDialog
@@ -61,7 +58,6 @@ from app.paths import app_root
 from app.point_format_store import load_formats, point_key, save_formats
 from app.preset_store import apply_preset, load_preset, save_preset
 from app.protocol_engine import ProtocolEngine
-from app.template_dialog import TemplateDialog
 from app.template_store import load_templates
 from app.xml_check_dialog import XmlCheckDialog
 from app.xml_validator import validate_device
@@ -84,9 +80,7 @@ class MainWindow(QMainWindow):
         self._xml_stem = ""
         self.device = DeviceModel()
         self.engine = ProtocolEngine(self.device)
-        self.fault_injector = FaultInjector()
-        self.recorded_frames: list[Frame] = []
-        self._last_request: tuple[int, Frame] | None = None
+        self.address = 1
         self._frame_records: list[dict] = []
 
         self.battery_config_path = self.app_dir / "data" / "battery_config.json"
@@ -129,6 +123,8 @@ class MainWindow(QMainWindow):
         self._port_scan_timer.start()
         self._update_counts()
         self._log("INFO", "工具启动")
+        self.battery_timer.start()
+        self._update_sim_status()
 
         self.port.readyRead.connect(self._on_ready_read)
         self.port.errorOccurred.connect(self._on_serial_error)
@@ -176,12 +172,6 @@ class MainWindow(QMainWindow):
         self.reconnect_cb.setVisible(False)
 
         top.addSpacing(10)
-        top.addWidget(QLabel("地址:"))
-        self.addr_spin = QSpinBox()
-        self.addr_spin.setRange(1, 247)
-        self.addr_spin.setValue(1)
-        self.addr_spin.setFixedWidth(64)
-        top.addWidget(self.addr_spin)
 
         self.xml_name_label = QLabel("未加载 XML")
         self.xml_name_label.setFixedWidth(170)
@@ -200,60 +190,10 @@ class MainWindow(QMainWindow):
         self.pause_cb.setVisible(False)
         self.reset_btn = QPushButton("重置数据")
         self.reset_btn.setToolTip(
-            "所有组重置为模板/零值；电池模型运行时请先停止模型"
+            "所有组重置为模板/零值；定值等待下一次 0x1B 读取"
         )
         self.reset_btn.setVisible(False)
         top.addStretch(1)
-
-        # 故障注入 + 模板
-        aux = QHBoxLayout()
-
-        fault_group = QGroupBox("故障注入")
-        fault_layout = QHBoxLayout(fault_group)
-        self.fault_drop_all_cb = QCheckBox("不回帧")
-        self.fault_delay_spin = QSpinBox()
-        self.fault_delay_spin.setRange(0, 5000)
-        self.fault_delay_spin.setSingleStep(50)
-        self.fault_delay_spin.setSuffix(" ms")
-        self.fault_delay_spin.setFixedWidth(90)
-        self.fault_delay_spin.setToolTip("每次响应延迟发送；超过 300ms 会触发 DTU 超时重发")
-        self.fault_bad_crc_cb = QCheckBox("错校验")
-        self.fault_wrong_addr_cb = QCheckBox("错地址+1")
-        self.fault_short_cb = QCheckBox("短帧")
-        self.fault_short_cb.setToolTip("少发最后 1 字节（校验和），DTU 会等超时")
-        self.fault_drop_every_spin = QSpinBox()
-        self.fault_drop_every_spin.setRange(0, 100)
-        self.fault_drop_every_spin.setFixedWidth(60)
-        self.fault_drop_every_spin.setToolTip("每 N 帧丢 1 帧，0=关闭")
-        self.fault_clear_btn = QPushButton("清除故障")
-        fault_layout.addWidget(self.fault_drop_all_cb)
-        fault_layout.addWidget(QLabel("延迟"))
-        fault_layout.addWidget(self.fault_delay_spin)
-        fault_layout.addWidget(self.fault_bad_crc_cb)
-        fault_layout.addWidget(self.fault_wrong_addr_cb)
-        fault_layout.addWidget(self.fault_short_cb)
-        fault_layout.addWidget(QLabel("丢帧 每"))
-        fault_layout.addWidget(self.fault_drop_every_spin)
-        fault_layout.addWidget(QLabel("帧丢1"))
-        fault_layout.addWidget(self.fault_clear_btn)
-        fault_layout.addStretch(1)
-
-        template_group = QGroupBox("模板")
-        template_layout = QHBoxLayout(template_group)
-        self.template_btn = QPushButton("模板...")
-        self.record_cb = QCheckBox("录制响应")
-        self.record_cb.setToolTip("取消自动应答后，勾选此项可监听并录制真实设备响应")
-        self.clear_record_btn = QPushButton("清空录制")
-        template_layout.addWidget(self.template_btn)
-        template_layout.addWidget(self.record_cb)
-        template_layout.addWidget(self.clear_record_btn)
-
-        aux.addWidget(fault_group, 1)
-        aux.addWidget(template_group)
-
-        self.aux_widget = QWidget()
-        self.aux_widget.setLayout(aux)
-        self.aux_widget.setVisible(False)
 
         # 左侧：按数据类型查看
         self.category_list = QListWidget()
@@ -323,11 +263,16 @@ class MainWindow(QMainWindow):
         frame_layout = QVBoxLayout(frame_widget)
         frame_layout.setContentsMargins(0, 0, 0, 0)
         frame_header = QHBoxLayout()
-        frame_header.addWidget(QLabel("RX / TX / ERR / ECHO"))
+        legend = QLabel(
+            '<span style="color:#c0392b; font-weight:bold;">RX</span>'
+            ' / '
+            '<span style="color:#1565c0; font-weight:bold;">TX</span>'
+        )
+        frame_header.addWidget(legend)
         frame_header.addStretch(1)
         frame_header.addWidget(QLabel("过滤:"))
         self.frame_filter_combo = QComboBox()
-        self.frame_filter_combo.addItems(["全部", "RX", "TX", "ERR", "ECHO"])
+        self.frame_filter_combo.addItems(["全部", "RX", "TX"])
         self.frame_filter_edit = QLineEdit()
         self.frame_filter_edit.setPlaceholderText("HEX")
         self.frame_filter_edit.setFixedWidth(170)
@@ -376,22 +321,10 @@ class MainWindow(QMainWindow):
         battery_layout.setSpacing(4)
 
         row1 = QHBoxLayout()
-        self.battery_start_btn = QPushButton("启动")
-        self.battery_stop_btn = QPushButton("停止")
-        self.battery_reset_btn = QPushButton("重置")
-        row1.addWidget(self.battery_start_btn)
-        row1.addWidget(self.battery_stop_btn)
-        row1.addWidget(self.battery_reset_btn)
-        battery_layout.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        self.battery_activation_btn = QPushButton("活化启动")
-        self.battery_activation_stop_btn = QPushButton("活化停止")
         self.battery_config_btn = QPushButton("参数...")
-        row2.addWidget(self.battery_activation_btn)
-        row2.addWidget(self.battery_activation_stop_btn)
-        row2.addWidget(self.battery_config_btn)
-        battery_layout.addLayout(row2)
+        row1.addWidget(self.battery_config_btn)
+        row1.addStretch(1)
+        battery_layout.addLayout(row1)
 
         row3 = QHBoxLayout()
         self.battery_ac_cb = QCheckBox("交流供电")
@@ -403,25 +336,6 @@ class MainWindow(QMainWindow):
         for checkbox in self.battery_phase_cbs:
             row3.addWidget(checkbox)
         battery_layout.addLayout(row3)
-
-        row4 = QHBoxLayout()
-        self.battery_load_spin = QDoubleSpinBox()
-        self.battery_load_spin.setDecimals(1)
-        self.battery_load_spin.setRange(0.0, 1000.0)
-        self.battery_load_spin.setValue(10.0)
-        self.battery_load_spin.setSuffix(" A")
-        self.battery_load_spin.setFixedWidth(80)
-        self.battery_charge_spin = QDoubleSpinBox()
-        self.battery_charge_spin.setDecimals(1)
-        self.battery_charge_spin.setRange(0.0, 1000.0)
-        self.battery_charge_spin.setValue(5.0)
-        self.battery_charge_spin.setSuffix(" A")
-        self.battery_charge_spin.setFixedWidth(80)
-        row4.addWidget(QLabel("负载"))
-        row4.addWidget(self.battery_load_spin)
-        row4.addWidget(QLabel("充电"))
-        row4.addWidget(self.battery_charge_spin)
-        battery_layout.addLayout(row4)
 
         row5 = QHBoxLayout()
         self.battery_soc_label = QLabel("SOC --")
@@ -454,13 +368,12 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root_layout = QVBoxLayout(root)
         root_layout.addLayout(top)
-        root_layout.addWidget(self.aux_widget)
         root_layout.addWidget(splitter, 1)
         self.setCentralWidget(root)
 
         self.status_label = QLabel("串口未打开")
         self.count_label = QLabel("RX 0 / TX 0")
-        self.sim_status_label = QLabel("电池模型: 停止")
+        self.sim_status_label = QLabel("电池模型: 运行")
         self.statusBar().addWidget(self.status_label, 1)
         self.statusBar().addPermanentWidget(self.count_label)
         self.statusBar().addPermanentWidget(self.sim_status_label)
@@ -473,7 +386,6 @@ class MainWindow(QMainWindow):
         self.auto_cb.toggled.connect(self._update_status)
         self.pause_cb.toggled.connect(self._update_status)
         self.reconnect_cb.toggled.connect(self._on_reconnect_toggled)
-        self.addr_spin.valueChanged.connect(self._update_status)
         self.category_list.currentItemChanged.connect(self._on_category_selected)
         self.table.currentCellChanged.connect(self._on_table_row_changed)
         self.table.itemChanged.connect(self._on_item_changed)
@@ -485,26 +397,13 @@ class MainWindow(QMainWindow):
         self.frame_filter_edit.textChanged.connect(self._render_frame_log)
         self.export_frame_btn.clicked.connect(self._export_frames)
         self.export_event_btn.clicked.connect(self._export_events)
-        self.fault_clear_btn.clicked.connect(self._clear_faults)
-        self.template_btn.clicked.connect(self._open_templates)
-        self.clear_record_btn.clicked.connect(self._clear_recorded)
 
         self._build_menu()
 
-        self.battery_start_btn.clicked.connect(self._start_battery)
-        self.battery_stop_btn.clicked.connect(self._stop_battery)
-        self.battery_activation_btn.clicked.connect(self._start_activation)
-        self.battery_activation_stop_btn.clicked.connect(self._stop_activation)
-        self.battery_reset_btn.clicked.connect(self._reset_battery)
         self.battery_config_btn.clicked.connect(self._edit_battery_config)
         self.battery_ac_cb.toggled.connect(self._on_battery_controls_changed)
         for checkbox in self.battery_phase_cbs:
             checkbox.toggled.connect(self._on_battery_controls_changed)
-        self.battery_load_spin.valueChanged.connect(self._on_battery_controls_changed)
-        self.battery_charge_spin.valueChanged.connect(
-            self._on_battery_controls_changed
-        )
-        self._update_battery_buttons()
         self._update_battery_labels()
 
     def _build_menu(self) -> None:
@@ -529,10 +428,6 @@ class MainWindow(QMainWindow):
         tool_menu.addSeparator()
         tool_menu.addAction("点格式...", self._edit_point_format)
         tool_menu.addAction("XML 检查...", self._check_xml)
-        tool_menu.addSeparator()
-        self.aux_action = tool_menu.addAction("显示高级工具栏")
-        self.aux_action.setCheckable(True)
-        self.aux_action.toggled.connect(self.aux_widget.setVisible)
 
     # ------------------------------------------------------------- settings
 
@@ -551,11 +446,6 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.baud_combo.setCurrentIndex(index)
 
-        try:
-            self.addr_spin.setValue(int(self.settings.value("address", 1)))
-        except (TypeError, ValueError):
-            self.addr_spin.setValue(1)
-
         auto = str(self.settings.value("auto_reply", "true")).lower()
         self.auto_cb.setChecked(auto in ("1", "true", "yes"))
         reconnect = str(self.settings.value("auto_reconnect", "true")).lower()
@@ -566,7 +456,6 @@ class MainWindow(QMainWindow):
     def _save_settings(self) -> None:
         self.settings.setValue("port", self.port_combo.currentData() or "")
         self.settings.setValue("baud", self.baud_combo.currentData() or 9600)
-        self.settings.setValue("address", self.addr_spin.value())
         self.settings.setValue("auto_reply", self.auto_cb.isChecked())
         self.settings.setValue("auto_reconnect", self.reconnect_cb.isChecked())
         if self.device.xml_path:
@@ -713,10 +602,9 @@ class MainWindow(QMainWindow):
 
     def _handle_frame(self, frame: Frame) -> None:
         if not frame.valid:
-            self._log_frame(
+            self._log(
                 "ERR",
                 f"{frame.error} | {frame.raw.hex(' ').upper()}",
-                frame=frame,
             )
             return
 
@@ -726,26 +614,14 @@ class MainWindow(QMainWindow):
 
         now = QDateTime.currentMSecsSinceEpoch()
         if frame.raw == self._last_tx and (now - self._last_tx_ms) < 300:
-            self._log_frame("ECHO", "忽略本机发送的回声", frame=frame)
             return
 
-        if frame.addr != self.addr_spin.value():
-            self._log("SKIP", f"地址不匹配: {frame.addr} != {self.addr_spin.value()}")
+        if frame.addr != self.address:
+            self._log("SKIP", f"地址不匹配: {frame.addr} != {self.address}")
             return
 
         request_funcs = (0x01, 0x02, 0x1A, 0x1B, 0x83, 0x03)
-        previous_request = self._last_request
-
-        if self._is_recordable_response(frame, now, previous_request):
-            self.recorded_frames.append(frame)
-            if len(self.recorded_frames) > 100:
-                self.recorded_frames.pop(0)
-            self._log("REC", frame.summary())
-            return
-
-        if frame.func in request_funcs:
-            self._last_request = (now, frame)
-        else:
+        if frame.func not in request_funcs:
             return
 
         if not self.auto_cb.isChecked() or self.pause_cb.isChecked():
@@ -755,6 +631,12 @@ class MainWindow(QMainWindow):
         if frame.func == 0x1A and frame.subtype == 0x0C:
             self.device.reset_defaults(self.templates)
             self._defer_fix_values()
+            self.battery_model.reset()
+            self._apply_battery_ui_to_model()
+            self._update_battery_labels()
+            self._battery_last_alarms = {}
+            self._battery_last_state = ""
+            self._log("MODEL", "DTU 遥控: 恢复出厂")
             self._populate_category(self.category)
 
         if frame.func == 0x02:
@@ -771,15 +653,6 @@ class MainWindow(QMainWindow):
                 if self.category == "YK":
                     self._refresh_current_values()
                 self._log("INFO", f"收到遥控: {control_name or '未命名'}")
-
-        if self.battery_timer.isActive():
-            if frame.func == 0x02:
-                control_group = self.device.find(0x02, frame.subtype)
-                control_name = (
-                    control_group.points[0].name
-                    if control_group and control_group.points
-                    else ""
-                )
                 if "活化启动" in control_name:
                     self.battery_model.start_activation()
                     self._log("MODEL", "DTU 遥控: 活化启动")
@@ -789,11 +662,8 @@ class MainWindow(QMainWindow):
                 elif "放电" in control_name and "停止" in control_name:
                     self.battery_model.stop_activation()
                     self._log("MODEL", "DTU 遥控: 停止放电")
-            elif frame.func == 0x1A and frame.subtype == 0x0C:
-                self.battery_model.reset()
-                self._log("MODEL", "DTU 遥控: 恢复出厂")
 
-        if self.battery_timer.isActive() and frame.func == 0x01:
+        if frame.func == 0x01:
             group = self.device.find(0x01, frame.subtype)
             if group is not None:
                 self._apply_battery_snapshot(group.key)
@@ -801,15 +671,18 @@ class MainWindow(QMainWindow):
 
         if frame.func == 0x1B:
             group = self.device.find(0x1B, frame.subtype)
-            if group is not None and not group.read_seen:
-                self._apply_template_to_group(group)
-                group.read_seen = True
+            if group is not None:
+                if not group.read_seen:
+                    self._apply_template_to_group(group)
+                    self._apply_configured_point_values(group.key)
+                    group.read_seen = True
                 if self.category == "FIX":
                     self._populate_category("FIX")
         elif frame.func == 0x1A and frame.subtype != 0x0C:
             group = self.device.find(0x1B, frame.subtype)
             if group is not None and not group.read_seen:
                 self._apply_template_to_group(group)
+                self._apply_configured_point_values(group.key)
                 group.read_seen = True
 
         response = self.engine.handle(frame)
@@ -820,22 +693,7 @@ class MainWindow(QMainWindow):
         if self.engine.last_note:
             self._log("INFO", self.engine.last_note)
 
-        fault = self.fault_injector.apply(
-            response, self._fault_config(), self.addr_spin.value()
-        )
-        if fault.notes:
-            self._log("FAULT", "; ".join(fault.notes))
-        if fault.data is None:
-            return
-
-        if fault.delay_ms > 0:
-            self._log("INFO", f"{fault.delay_ms} ms 后发送响应")
-            QTimer.singleShot(
-                fault.delay_ms,
-                lambda data=fault.data: self._send_response(data),
-            )
-        else:
-            self._send_response(fault.data)
+        self._send_response(response)
 
         if (
             frame.func == 0x1A
@@ -864,86 +722,6 @@ class MainWindow(QMainWindow):
         self._log_frame("TX", tx_frame.hex(), frame=tx_frame)
         self._last_tx = data
         self._last_tx_ms = QDateTime.currentMSecsSinceEpoch()
-
-    def _is_recordable_response(
-        self,
-        frame: Frame,
-        now: int,
-        previous_request: tuple[int, Frame] | None,
-    ) -> bool:
-        if not self.record_cb.isChecked():
-            return False
-        if frame.addr != self.addr_spin.value():
-            return False
-
-        # 0x81/0x82 只可能是响应
-        if frame.func in (0x81, 0x82):
-            return True
-
-        # 0x1A/0x1B/0x83 请求和响应功能码相同，用“请求后 20~280ms、
-        # 同地址/功能码/子类型、有数据区”判断响应。
-        if frame.func in (0x1A, 0x1B, 0x83):
-            if not frame.data or previous_request is None:
-                return False
-            timestamp, request = previous_request
-            delta = now - timestamp
-            return (
-                20 <= delta <= 280
-                and request.addr == frame.addr
-                and request.func == frame.func
-                and request.subtype == frame.subtype
-            )
-        return False
-
-    def _fault_config(self) -> FaultConfig:
-        return FaultConfig(
-            drop_all=self.fault_drop_all_cb.isChecked(),
-            delay_ms=self.fault_delay_spin.value(),
-            bad_checksum=self.fault_bad_crc_cb.isChecked(),
-            wrong_address=self.fault_wrong_addr_cb.isChecked(),
-            short_frame=self.fault_short_cb.isChecked(),
-            drop_every_n=self.fault_drop_every_spin.value(),
-        )
-
-    def _clear_faults(self) -> None:
-        self.fault_drop_all_cb.setChecked(False)
-        self.fault_delay_spin.setValue(0)
-        self.fault_bad_crc_cb.setChecked(False)
-        self.fault_wrong_addr_cb.setChecked(False)
-        self.fault_short_cb.setChecked(False)
-        self.fault_drop_every_spin.setValue(0)
-        self.fault_injector.reset()
-        self._log("INFO", "故障注入已清除")
-
-    def _clear_recorded(self) -> None:
-        self.recorded_frames.clear()
-        self._log("INFO", "录制缓存已清空")
-
-    def _open_templates(self) -> None:
-        row = self.table.currentRow()
-        selected_group = (
-            self._row_specs[row][1]
-            if 0 <= row < len(self._row_specs)
-            else None
-        )
-        dialog = TemplateDialog(
-            self,
-            self.templates,
-            selected_group,
-            self.recorded_frames,
-            self.templates_path,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        self.templates = dict(dialog.templates)
-        if dialog.apply_now:
-            self.device.reset_defaults(self.templates)
-            self._defer_fix_values()
-            self._refresh_categories()
-            self._log("INFO", "模板已保存并应用（所有组已按模板重置）")
-        else:
-            self._log("INFO", "模板已保存（下次加载 XML 时生效）")
 
     def _defer_fix_values(self) -> None:
         """定值组在收到 0x1B 读请求前不显示值。"""
@@ -977,48 +755,27 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- battery
 
-    def _start_battery(self) -> None:
-        if not self.device.groups:
-            QMessageBox.information(self, "电池模型", "请先加载 XML")
-            return
-        self.battery_model.reset()
-        self._apply_battery_ui_to_model()
-        self._battery_last_alarms = {}
-        self._battery_last_state = ""
-        self._clear_model_values()
-        self._update_battery_labels()
-        self.battery_timer.start()
-        self._update_battery_buttons()
-        self._log(
-            "MODEL",
-            "电池模型已启动；等待 DTU 轮询后更新点表",
-        )
-
-    def _stop_battery(self) -> None:
-        if not self.battery_timer.isActive():
-            return
-        self.battery_timer.stop()
-        self._update_battery_buttons()
-        self._log("MODEL", "电池模型已停止")
-
-    def _reset_battery(self) -> None:
-        self.battery_model.reset()
-        self._apply_battery_ui_to_model()
-        self._clear_model_values()
-        self._update_battery_labels()
-        self._battery_last_alarms = {}
-        self._battery_last_state = ""
-        self._log("MODEL", "电池模型已重置；点表等待轮询")
-
     def _edit_battery_config(self) -> None:
-        dialog = BatteryConfigDialog(self, self.battery_model.config)
+        old_values = dict(self.battery_model.config.point_values)
+        dialog = BatteryConfigDialog(
+            self,
+            self.battery_model.config,
+            self.device,
+            self._formats,
+        )
         if (
             dialog.exec() != QDialog.DialogCode.Accepted
             or dialog.result_config is None
         ):
             return
 
-        running = self.battery_timer.isActive()
+        new_values = dict(dialog.result_config.point_values)
+        changed_keys = {
+            key
+            for key in set(old_values) | set(new_values)
+            if old_values.get(key) != new_values.get(key)
+        }
+
         self.battery_model.config = dialog.result_config
         try:
             save_battery_config(self.battery_config_path, dialog.result_config)
@@ -1027,30 +784,29 @@ class MainWindow(QMainWindow):
 
         self.battery_model.reset()
         self._apply_battery_ui_to_model()
+        self._reset_configured_fix_groups(changed_keys)
         self._clear_model_values()
         self._update_battery_labels()
         self._battery_last_alarms = {}
         self._battery_last_state = ""
+        if self.category == "FIX":
+            self._populate_category("FIX")
         self._log(
             "MODEL",
-            "电池参数已更新；点表等待轮询"
-            + ("，模型已重置" if running else ""),
+            "电池参数已更新；定值将在下次 0x1B 读取时应用配置值",
         )
 
-    def _start_activation(self) -> None:
-        self.battery_model.start_activation()
-        self._log("MODEL", "活化启动")
-        self._update_battery_labels()
-
-    def _stop_activation(self) -> None:
-        self.battery_model.stop_activation()
-        self._log("MODEL", "活化停止")
-        self._update_battery_labels()
+    def _reset_configured_fix_groups(self, keys: set[str]) -> None:
+        if not keys:
+            return
+        for group in self.device.groups.values():
+            if group.kind not in ("FIX", "RAW"):
+                continue
+            if any(point_key(point) in keys for point in group.points):
+                group.read_seen = False
+                group.data = bytearray(len(group.data))
 
     def _apply_battery_ui_to_model(self) -> None:
-        self.battery_model.config.discharge_current = self.battery_load_spin.value()
-        self.battery_model.config.activation_current = self.battery_load_spin.value()
-        self.battery_model.config.charge_current = self.battery_charge_spin.value()
         self.battery_model.ac_present = self.battery_ac_cb.isChecked()
         self.battery_model.phase_loss = [
             checkbox.isChecked() for checkbox in self.battery_phase_cbs
@@ -1058,8 +814,7 @@ class MainWindow(QMainWindow):
 
     def _on_battery_controls_changed(self, *_args) -> None:
         self._apply_battery_ui_to_model()
-        if self.battery_timer.isActive():
-            self._update_battery_labels()
+        self._update_battery_labels()
 
     def _on_battery_tick(self) -> None:
         self.battery_model.tick(1.0)
@@ -1093,17 +848,35 @@ class MainWindow(QMainWindow):
     ) -> int:
         snapshot = self.battery_model.snapshot()
         updated, notes = apply_snapshot(
-            self.device, snapshot, self._formats, group_key
+            self.device,
+            snapshot,
+            self._formats,
+            group_key,
+            self.battery_model.config.point_values,
+        )
+        for note in notes:
+            self._log("WARN", note)
+        return updated
+
+    def _apply_configured_point_values(
+        self, group_key: tuple[int, int] | None = None
+    ) -> int:
+        updated, notes = apply_point_values(
+            self.device,
+            self.battery_model.config.point_values,
+            self._formats,
+            group_key,
         )
         for note in notes:
             self._log("WARN", note)
         return updated
 
     def _clear_model_values(self) -> None:
+        configured = set(self.battery_model.config.point_values)
         for group in self.device.groups.values():
             for point in group.points:
                 role = role_for_point(point)
-                if role is None:
+                if role is None and point_key(point) not in configured:
                     continue
                 if role == "temperature" and any(
                     word in point.name for word in ("告警", "阈值")
@@ -1130,14 +903,6 @@ class MainWindow(QMainWindow):
         self.battery_state_label.setText(
             f"状态: {self.battery_model.state_text()}"
         )
-
-    def _update_battery_buttons(self) -> None:
-        running = self.battery_timer.isActive()
-        self.battery_start_btn.setEnabled(not running)
-        self.battery_stop_btn.setEnabled(running)
-        self.battery_activation_btn.setEnabled(running)
-        self.battery_activation_stop_btn.setEnabled(running)
-        self._update_sim_status()
 
     def _refresh_current_values(self) -> None:
         if not self._row_specs:
@@ -1218,8 +983,7 @@ class MainWindow(QMainWindow):
     def _update_sim_status(self) -> None:
         if not hasattr(self, "sim_status_label"):
             return
-        battery = "运行" if self.battery_timer.isActive() else "停止"
-        self.sim_status_label.setText(f"电池模型: {battery}")
+        self.sim_status_label.setText("电池模型: 运行")
 
     # ------------------------------------------------------------------ xml
 
@@ -1241,11 +1005,6 @@ class MainWindow(QMainWindow):
         self.xml_name_label.setToolTip(path or name)
 
     def _load_xml_path(self, path: str) -> None:
-        if self.battery_timer.isActive():
-            self.battery_timer.stop()
-            self._update_battery_buttons()
-            self._log("INFO", "加载 XML，电池模型已停止")
-
         try:
             self.device.load_xml(path)
             self.templates = load_templates(self.templates_path)
@@ -2002,7 +1761,7 @@ class MainWindow(QMainWindow):
         auto = "开" if self.auto_cb.isChecked() else "关"
         paused = " | 暂停" if self.pause_cb.isChecked() else ""
         self.status_label.setText(
-            f"串口{state} | 地址 {self.addr_spin.value()} | 自动应答 {auto}{paused}"
+            f"串口{state} | 自动应答 {auto}{paused}"
         )
 
     def _update_counts(self) -> None:
@@ -2027,7 +1786,20 @@ class MainWindow(QMainWindow):
         if len(self._frame_records) > 5000:
             self._frame_records.pop(0)
         if self._frame_filter_matches(record):
-            self._append_line(self.frame_view, self.frame_autoscroll_cb, line)
+            self._append_frame_line(record)
+
+    def _append_frame_line(self, record: dict) -> None:
+        color = "#c0392b" if record["tag"] == "RX" else "#1565c0"
+        cursor = self.frame_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        char_format = QTextCharFormat()
+        char_format.setForeground(QBrush(QColor(color)))
+        cursor.insertText(record["line"], char_format)
+        cursor.insertBlock()
+        self.frame_view.setTextCursor(cursor)
+        if self.frame_autoscroll_cb.isChecked():
+            bar = self.frame_view.verticalScrollBar()
+            bar.setValue(bar.maximum())
 
     def _frame_filter_matches(self, record: dict) -> bool:
         direction = self.frame_filter_combo.currentText()
@@ -2042,11 +1814,7 @@ class MainWindow(QMainWindow):
         self.frame_view.clear()
         for record in self._frame_records:
             if self._frame_filter_matches(record):
-                self._append_line(
-                    self.frame_view,
-                    self.frame_autoscroll_cb,
-                    record["line"],
-                )
+                self._append_frame_line(record)
 
     def _clear_frame_log(self) -> None:
         self._frame_records.clear()
@@ -2061,30 +1829,79 @@ class MainWindow(QMainWindow):
         if not records:
             QMessageBox.information(self, "导出报文", "当前过滤条件下没有报文")
             return
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "导出报文",
-            str(self.app_dir / "data" / "frames.csv"),
-            "CSV (*.csv)",
+            str(self.app_dir / "data" / "frames.txt"),
+            "文本文件 (*.txt);;Markdown (*.md)",
         )
         if not path:
             return
+
+        target = Path(path)
+        if target.suffix.lower() not in (".txt", ".md"):
+            suffix = ".md" if "Markdown" in selected_filter else ".txt"
+            target = target.with_suffix(suffix)
+        path = str(target)
+
+        direction = self.frame_filter_combo.currentText()
+        query = self.frame_filter_edit.text().strip()
+        filter_text = direction if not query else f"{direction} / {query}"
+
         try:
-            self._write_frames_csv(path, records)
+            if target.suffix.lower() == ".md":
+                self._write_frames_md(path, records, filter_text)
+            else:
+                self._write_frames_txt(path, records, filter_text)
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", str(exc))
             return
         self._log("INFO", f"已导出 {len(records)} 条报文: {path}")
 
     @staticmethod
-    def _write_frames_csv(path: str, records: list[dict]) -> None:
-        with open(path, "w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(["时间", "方向", "原始帧"])
-            for record in records:
-                frame = record.get("frame")
-                frame_text = frame.hex() if frame is not None else record["text"]
-                writer.writerow([record["time"], record["tag"], frame_text])
+    def _frame_text(record: dict) -> str:
+        frame = record.get("frame")
+        return frame.hex() if frame is not None else record["text"]
+
+    @classmethod
+    def _write_frames_txt(
+        cls, path: str, records: list[dict], filter_text: str
+    ) -> None:
+        exported = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
+        lines = [
+            "充电机模拟器 报文记录",
+            f"导出时间: {exported}",
+            f"过滤条件: {filter_text or '全部'}",
+            f"条数: {len(records)}",
+            "",
+        ]
+        for record in records:
+            lines.append(
+                f"[{record['time']}] {record['tag']:<3} {cls._frame_text(record)}"
+            )
+        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+
+    @classmethod
+    def _write_frames_md(
+        cls, path: str, records: list[dict], filter_text: str
+    ) -> None:
+        exported = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
+        lines = [
+            "# 充电机模拟器 报文记录",
+            "",
+            f"- 导出时间：{exported}",
+            f"- 过滤条件：{filter_text or '全部'}",
+            f"- 条数：{len(records)}",
+            "",
+            "| 时间 | 方向 | 原始帧 |",
+            "|---|---|---|",
+        ]
+        for record in records:
+            frame_text = cls._frame_text(record).replace("|", "\\|")
+            lines.append(
+                f"| {record['time']} | {record['tag']} | `{frame_text}` |"
+            )
+        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _export_events(self) -> None:
         text = self.event_view.toPlainText()

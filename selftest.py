@@ -13,6 +13,7 @@ import tempfile
 from app.battery_model import (
     BatteryConfig,
     BatteryModel,
+    apply_point_values,
     apply_snapshot,
     load_battery_config,
     role_for_point,
@@ -338,6 +339,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as temp_dir:
         config_path = Path(temp_dir) / "battery_config.json"
+        yc_group = device.find(1, 1)
+        assert yc_group is not None and yc_group.points
+        point_value_key = point_key(yc_group.points[0])
         custom = BatteryConfig(
             capacity_ah=40.0,
             initial_soc=80.0,
@@ -346,6 +350,7 @@ def main() -> int:
             empty_voltage=43.0,
             undervoltage=47.0,
             cutoff=44.0,
+            point_values={point_value_key: 48.0},
         )
         save_battery_config(config_path, custom)
         loaded = load_battery_config(config_path)
@@ -355,11 +360,29 @@ def main() -> int:
             and loaded.undervoltage == 47.0,
             "电池参数保存/加载",
         )
+        check(
+            loaded.point_values.get(point_value_key) == 48.0,
+            "点值配置保存/加载",
+        )
         config_path.write_text("not json", encoding="utf-8")
         check(
             load_battery_config(config_path).capacity_ah == 24.0,
             "坏参数文件回退默认",
         )
+
+    yc_group = device.find(1, 1)
+    assert yc_group is not None and yc_group.points
+    point_value_key = point_key(yc_group.points[0])
+    updated, notes = apply_point_values(
+        device, {point_value_key: 48.0}, {}, yc_group.key
+    )
+    raw_value = int.from_bytes(
+        yc_group.data[0:2], "big"
+    )
+    check(
+        updated == 1 and not notes and raw_value == 48000,
+        "配置点值按工程值写入遥测",
+    )
 
     check(
         role_for_point(Point("YC", "电池电压", 1, 1, 0, 2))

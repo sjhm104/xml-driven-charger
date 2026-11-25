@@ -30,6 +30,8 @@ class BatteryConfig:
     cutoff: float = 43.2
     capacity_fault_soc: float = 5.0
     temperature: float = 25.0
+    # 按 point_key 保存的遥测/定值工程值；有值时优先于模型角色值
+    point_values: dict[str, float] = field(default_factory=dict)
 
 
 # 遥测/定值角色（只匹配 YC/FIX）
@@ -213,11 +215,53 @@ class BatteryModel:
         return "浮充"
 
 
+def apply_point_values(
+    device: DeviceModel,
+    point_values: dict[str, float],
+    formats: dict[str, PointFormat] | None = None,
+    group_key: tuple[int, int] | None = None,
+) -> tuple[int, list[str]]:
+    """把用户配置的遥测/定值工程值写入点表；group_key 限定只写某一组。"""
+    if not point_values:
+        return 0, []
+    formats = formats or {}
+    updated = 0
+    notes: list[str] = []
+
+    for group in device.groups.values():
+        if group_key is not None and group.key != group_key:
+            continue
+        for point in group.points:
+            key = point_key(point)
+            if key not in point_values:
+                continue
+            if point.kind not in ("YC", "FIX") or point.inf <= 0:
+                continue
+
+            fmt = formats.get(key, PointFormat())
+            try:
+                data = fmt.encode_eng(
+                    float(point_values[key]), point.inf, point.factor
+                )
+            except (ValueError, OverflowError, struct.error) as exc:
+                notes.append(f"{point.name}: {exc}")
+                continue
+
+            end = point.fun + point.inf
+            if end > len(group.data):
+                group.data.extend(b"\x00" * (end - len(group.data)))
+            group.data[point.fun:end] = data
+            updated += 1
+
+    return updated, notes
+
+
 def apply_snapshot(
     device: DeviceModel,
     snapshot: dict,
     formats: dict[str, PointFormat] | None = None,
     group_key: tuple[int, int] | None = None,
+    point_values: dict[str, float] | None = None,
 ) -> tuple[int, list[str]]:
     """把模型状态写到匹配角色的点；group_key 限定只写某一组。"""
     formats = formats or {}
@@ -271,6 +315,13 @@ def apply_snapshot(
             group.data[point.fun:end] = data
             updated += 1
 
+    if point_values:
+        overridden, override_notes = apply_point_values(
+            device, point_values, formats, group_key
+        )
+        updated += overridden
+        notes.extend(override_notes)
+
     return updated, notes
 
 
@@ -286,9 +337,20 @@ def load_battery_config(path: str | Path) -> BatteryConfig:
         return BatteryConfig()
 
     allowed = {item.name for item in fields(BatteryConfig)}
-    kwargs: dict[str, float] = {}
+    kwargs: dict[str, object] = {}
     for key, value in obj.items():
         if key not in allowed:
+            continue
+        if key == "point_values":
+            if not isinstance(value, dict):
+                continue
+            parsed: dict[str, float] = {}
+            for point_key_text, point_value in value.items():
+                try:
+                    parsed[str(point_key_text)] = float(point_value)
+                except (TypeError, ValueError):
+                    continue
+            kwargs[key] = parsed
             continue
         try:
             kwargs[key] = float(value)
