@@ -83,7 +83,8 @@ class Group:
     data: bytearray = field(default_factory=bytearray)
     result: int = 1  # 遥控/配置应答结果：0x01 成功，0x81 失败
     read_seen: bool = True  # 定值组是否已经收到过 0x1B 读请求
-    closed: bool = False  # 遥控状态：False=分，True=合
+    last_result: int | None = None  # 最近一次遥控结果
+    last_time: str = ""  # 最近一次遥控时间
 
     @property
     def key(self) -> tuple[int, int]:
@@ -258,6 +259,7 @@ class DeviceModel:
         for group in self.groups.values():
             group.data = bytearray(len(group.data))
             group.result = 1
-            group.closed = False
+            group.last_result = None
+            group.last_time = ""
             if group.kind == "YK" and group.data:
                 group.data[0] = 1

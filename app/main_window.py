@@ -113,11 +113,15 @@ class MainWindow(QMainWindow):
         self._current_group: Group | None = None
         self.category = "YC"
         self._row_specs: list[tuple] = []
+        self.yx_checkboxes: dict[str, QCheckBox] = {}
+        self._yx_points: dict[str, tuple[Group, Point]] = {}
+        self._yx_overrides: dict[str, bool] = {}
         self._rx_count = 0
         self._tx_count = 0
 
         self._build_ui()
         self._refresh_categories()
+        self._refresh_yx_simulation()
         self._refresh_ports()
         self._load_settings()
         self._set_port_open(False)
@@ -129,10 +133,6 @@ class MainWindow(QMainWindow):
 
         self.port.readyRead.connect(self._on_ready_read)
         self.port.errorOccurred.connect(self._on_serial_error)
-
-        last_xml = str(self.settings.value("xml_path", "") or "")
-        if last_xml and Path(last_xml).exists():
-            self._load_xml_path(last_xml)
 
     # ------------------------------------------------------------------ UI
 
@@ -213,6 +213,24 @@ class MainWindow(QMainWindow):
         self.xml_warnings.setWordWrap(True)
         self.xml_warnings.setStyleSheet("color: #b35c00;")
         left_layout.addWidget(self.xml_warnings)
+
+        self.yx_sim_group = QGroupBox("遥信模拟")
+        yx_sim_layout = QVBoxLayout(self.yx_sim_group)
+        yx_sim_hint = QLabel("勾选=强制合；取消=自动")
+        yx_sim_hint.setStyleSheet("color: #777;")
+        yx_sim_layout.addWidget(yx_sim_hint)
+        self.yx_checks_host = QWidget()
+        self.yx_checks_layout = QVBoxLayout(self.yx_checks_host)
+        self.yx_checks_layout.setContentsMargins(0, 0, 0, 0)
+        self.yx_checks_layout.setSpacing(2)
+        yx_scroll = QScrollArea()
+        yx_scroll.setWidgetResizable(True)
+        yx_scroll.setMaximumHeight(230)
+        yx_scroll.setWidget(self.yx_checks_host)
+        yx_sim_layout.addWidget(yx_scroll)
+        self.yx_sim_group.setVisible(False)
+        left_layout.addWidget(self.yx_sim_group)
+
         left_layout.addStretch(1)
 
         # 右侧：点表
@@ -449,14 +467,13 @@ class MainWindow(QMainWindow):
         self.reconnect_cb.setChecked(reconnect in ("1", "true", "yes"))
         if hasattr(self, "reconnect_action"):
             self.reconnect_action.setChecked(self.reconnect_cb.isChecked())
+        self.settings.remove("xml_path")
 
     def _save_settings(self) -> None:
         self.settings.setValue("port", self.port_combo.currentData() or "")
         self.settings.setValue("baud", self.baud_combo.currentData() or 9600)
         self.settings.setValue("auto_reply", self.auto_cb.isChecked())
         self.settings.setValue("auto_reconnect", self.reconnect_cb.isChecked())
-        if self.device.xml_path:
-            self.settings.setValue("xml_path", str(self.device.xml_path))
         self.settings.sync()
 
     # --------------------------------------------------------------- serial
@@ -628,6 +645,7 @@ class MainWindow(QMainWindow):
         if frame.func == 0x1A and frame.subtype == 0x0C:
             self.device.reset_defaults()
             self._defer_fix_values()
+            self._clear_yx_overrides()
             self._reset_model_protocol_settings()
             self._sync_model_from_point_values(
                 self.battery_model.config.point_values
@@ -648,11 +666,6 @@ class MainWindow(QMainWindow):
                     if control_group.points
                     else ""
                 )
-                for group in self.device.groups.values():
-                    if group.kind == "YK":
-                        group.closed = group is control_group
-                if self.category == "YK":
-                    self._refresh_current_values()
                 self._log("INFO", f"收到遥控: {control_name or '未命名'}")
                 if "活化启动" in control_name:
                     self.battery_model.start_activation()
@@ -695,6 +708,17 @@ class MainWindow(QMainWindow):
             self._log("INFO", self.engine.last_note)
 
         self._send_response(response)
+
+        if frame.func == 0x02 and control_group is not None:
+            if len(response) >= 7:
+                control_group.last_result = response[6]
+                control_group.last_time = QDateTime.currentDateTime().toString(
+                    "HH:mm:ss"
+                )
+                result_text = "成功" if response[6] == 0x01 else "失败"
+                self._log("INFO", f"遥控结果: {result_text}")
+            if self.category == "YK":
+                self._refresh_current_values()
 
         if frame.func == 0x1B or (
             frame.func == 0x1A and frame.subtype != 0x0C
@@ -938,7 +962,52 @@ class MainWindow(QMainWindow):
         )
         for note in notes:
             self._log("WARN", note)
+        self._apply_yx_overrides(group_key)
         return updated
+
+    def _apply_yx_overrides(
+        self, group_key: tuple[int, int] | None = None
+    ) -> None:
+        for key, checked in self._yx_overrides.items():
+            entry = self._yx_points.get(key)
+            if entry is None:
+                continue
+            group, point = entry
+            if group_key is not None and group.key != group_key:
+                continue
+            if point.kind != "YX" or not (0 <= point.inf < 8):
+                continue
+            if point.fun >= len(group.data):
+                group.data.extend(
+                    b"\x00" * (point.fun + 1 - len(group.data))
+                )
+            mask = 1 << point.inf
+            if checked:
+                group.data[point.fun] = group.data[point.fun] | mask
+            else:
+                group.data[point.fun] = group.data[point.fun] & (~mask & 0xFF)
+
+    def _on_yx_override(
+        self, key: str, label: str, checked: bool
+    ) -> None:
+        if checked:
+            self._yx_overrides[key] = True
+        else:
+            self._yx_overrides.pop(key, None)
+        self._apply_yx_overrides()
+        if self.category == "YX":
+            self._refresh_current_values()
+        self._log(
+            "SIM",
+            f"遥信模拟: {label} = {'合' if checked else '自动'}",
+        )
+
+    def _clear_yx_overrides(self) -> None:
+        self._yx_overrides.clear()
+        for checkbox in self.yx_checkboxes.values():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
 
     def _apply_configured_point_values(
         self, group_key: tuple[int, int] | None = None
@@ -1033,9 +1102,12 @@ class MainWindow(QMainWindow):
                     continue
 
                 if point.kind == "YK":
-                    item = self.table.item(row, 4)
-                    if item is not None:
-                        self._style_yx_item(item, group.closed)
+                    result_item = self.table.item(row, 4)
+                    if result_item is not None:
+                        self._style_yk_result(result_item, group)
+                    time_item = self.table.item(row, 5)
+                    if time_item is not None:
+                        time_item.setText(group.last_time or "-")
                     continue
 
                 if point.kind not in ("YC", "FIX"):
@@ -1103,6 +1175,7 @@ class MainWindow(QMainWindow):
             self._xml_stem = ""
             self._protocol_defaults = defaults_for_xml("")
             self._refresh_categories()
+            self._refresh_yx_simulation()
             self._set_xml_name("未加载 XML")
             self.xml_summary.setText("XML 加载失败")
             self.xml_summary.setToolTip(path)
@@ -1112,6 +1185,7 @@ class MainWindow(QMainWindow):
             return
 
         self._refresh_categories()
+        self._refresh_yx_simulation()
         counts = self.device.point_counts()
         summary = (
             f"遥测 {counts['YC']} / 遥信 {counts['YX']} / "
@@ -1205,6 +1279,42 @@ class MainWindow(QMainWindow):
         if applied == 0:
             QMessageBox.warning(self, "加载预设", "没有匹配到任何组")
 
+    def _refresh_yx_simulation(self) -> None:
+        while self.yx_checks_layout.count():
+            item = self.yx_checks_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.yx_checkboxes.clear()
+        self._yx_points.clear()
+        self._yx_overrides.clear()
+
+        count = 0
+        for group in self.device.sorted_groups():
+            for point in group.points:
+                if point.kind != "YX":
+                    continue
+                key = point_key(point)
+                label = f"[0x{group.fun_type:04X}] {point.name or '(未命名)'}"
+                checkbox = QCheckBox(label)
+                checkbox.setToolTip(
+                    f"{label} | 字节 {point.fun} 位 {point.inf}"
+                )
+                checkbox.toggled.connect(
+                    lambda checked, k=key, text=label: self._on_yx_override(
+                        k, text, checked
+                    )
+                )
+                self.yx_checks_layout.addWidget(checkbox)
+                self.yx_checkboxes[key] = checkbox
+                self._yx_points[key] = (group, point)
+                count += 1
+
+        if count:
+            self.yx_checks_layout.addStretch(1)
+        self.yx_sim_group.setVisible(bool(count))
+
     def _refresh_categories(self) -> None:
         counts = self.device.point_counts()
         current = self.category if self.category in CATEGORY_ORDER else "YC"
@@ -1257,6 +1367,8 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         if len(headers) == 9:
             widths = [65, 150, 50, 45, 110, 80, 55, 80]
+        elif len(headers) == 7:
+            widths = [65, 170, 55, 45, 75, 90]
         elif len(headers) == 6:
             widths = [65, 170, 55, 45, 90]
         else:
@@ -1318,7 +1430,15 @@ class MainWindow(QMainWindow):
         self.group_info.setText(f"共 {len(rows)} 行")
 
         if kind == "YK":
-            headers = ["组", "名称", "功能码", "子类型", "值", "说明"]
+            headers = [
+                "组",
+                "名称",
+                "功能码",
+                "子类型",
+                "最后结果",
+                "最后时间",
+                "说明",
+            ]
             self._style_table(headers)
             self.table.setRowCount(max(1, len(rows)))
             if not rows:
@@ -1338,12 +1458,17 @@ class MainWindow(QMainWindow):
                 self.table.setItem(
                     row, 3, self._make_item(f"0x{point.entry_no:02X}")
                 )
-                item = self._make_item("")
-                self._style_yx_item(item, group.closed)
-                self.table.setItem(row, 4, item)
+                result_item = self._make_item("")
+                self._style_yk_result(result_item, group)
+                self.table.setItem(row, 4, result_item)
                 self.table.setItem(
                     row,
                     5,
+                    self._make_item(group.last_time or "-"),
+                )
+                self.table.setItem(
+                    row,
+                    6,
                     self._make_item(
                         f"ID={point.ied_dot}" if point.ied_dot else ""
                     ),
@@ -1580,6 +1705,23 @@ class MainWindow(QMainWindow):
             f"点格式已更新: {point.name or '(未命名)'} -> "
             f"{dialog.result.describe() or 'auto'}",
         )
+
+    def _style_yk_result(
+        self, item: QTableWidgetItem, group: Group
+    ) -> None:
+        result = group.last_result
+        if result is None:
+            text, color, bold = "-", "#555555", False
+        elif result == 0x01:
+            text, color, bold = "成功", "#1e8449", True
+        else:
+            text, color, bold = f"失败(0x{result:02X})", "#c0392b", True
+        item.setText(text)
+        item.setForeground(QBrush(QColor(color)))
+        font = item.font()
+        font.setBold(bold)
+        item.setFont(font)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
     def _style_yx_item(self, item: QTableWidgetItem, closed: bool) -> None:
         item.setText("合" if closed else "分")
@@ -1819,6 +1961,7 @@ class MainWindow(QMainWindow):
             return
         self.device.reset_defaults()
         self._defer_fix_values()
+        self._clear_yx_overrides()
         self._populate_category(self.category)
         self._log("INFO", "所有组已重置为协议默认值/零值；定值等待 0x1B 读取")
 
