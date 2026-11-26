@@ -502,6 +502,14 @@ class MainWindow(QMainWindow):
         self._open_port(silent=False)
 
     def _open_port(self, silent: bool = False) -> bool:
+        if not self.device.groups:
+            if not silent:
+                self._log("WARN", "未加载 XML，无法打开串口")
+                QMessageBox.warning(
+                    self, "提示", "请先加载 XML 文件，再打开串口"
+                )
+            return False
+
         name = self.port_combo.currentData()
         if not name:
             if not silent:
@@ -1142,14 +1150,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ xml
 
     def _choose_xml(self) -> None:
+        start_dir = str(
+            self.settings.value("xml_dir", "") or self.app_dir
+        )
+        if not Path(start_dir).is_dir():
+            start_dir = str(self.app_dir)
         path, _ = QFileDialog.getOpenFileName(
             self,
             "选择装置类型表",
-            str(self.app_dir),
+            start_dir,
             "XML 文件 (*.xml);;所有文件 (*)",
         )
-        if path:
-            self._load_xml_path(path)
+        if not path:
+            return
+        self.settings.setValue("xml_dir", str(Path(path).parent))
+        self.settings.sync()
+        self._load_xml_path(path)
 
     def _set_xml_name(self, name: str, path: str = "") -> None:
         metrics = self.xml_name_label.fontMetrics()
@@ -1206,8 +1222,6 @@ class MainWindow(QMainWindow):
                 warnings.append("没有遥测/遥信点（MeasureDefine/SignalDefine 为空）")
             if counts["YK"] == 0:
                 warnings.append("没有遥控点（ControlDefine 为空）")
-            if counts["FIX"] == 0:
-                warnings.append("没有定值点（FixValDefine/SetPointDefine 为空）")
         for warning in warnings:
             self._log("WARN", warning)
 
