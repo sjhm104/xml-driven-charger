@@ -102,7 +102,13 @@ class PointFormat:
         scale = self.effective_scale(default_scale)
         if scale == 0:
             raise ValueError("系数不能为 0")
-        return self.encode_raw((value - self.offset) / scale, length)
+        scaled = (value - self.offset) / scale
+        try:
+            return self.encode_raw(scaled, length)
+        except (struct.error, OverflowError):
+            # XML 系数可能和字段宽度不一致，例如 1 字节电量配 0.01 系数：
+            # 100% 会算成 10000，放不进 0~255。原值本身能放下时按原值写入。
+            return self.encode_raw(value - self.offset, length)
 
     def describe(self) -> str:
         if self.code == "auto" and self.offset == 0 and self.scale is None:

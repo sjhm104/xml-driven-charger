@@ -216,7 +216,7 @@ class MainWindow(QMainWindow):
 
         self.yx_sim_group = QGroupBox("遥信模拟")
         yx_sim_layout = QVBoxLayout(self.yx_sim_group)
-        yx_sim_hint = QLabel("勾选=强制合；取消=自动")
+        yx_sim_hint = QLabel("勾选=强制合；取消=清除并恢复模型计算")
         yx_sim_hint.setStyleSheet("color: #777;")
         yx_sim_layout.addWidget(yx_sim_hint)
         self.yx_checks_host = QWidget()
@@ -983,31 +983,37 @@ class MainWindow(QMainWindow):
             group, point = entry
             if group_key is not None and group.key != group_key:
                 continue
-            if point.kind != "YX" or not (0 <= point.inf < 8):
-                continue
-            if point.fun >= len(group.data):
-                group.data.extend(
-                    b"\x00" * (point.fun + 1 - len(group.data))
-                )
-            mask = 1 << point.inf
-            if checked:
-                group.data[point.fun] = group.data[point.fun] | mask
-            else:
-                group.data[point.fun] = group.data[point.fun] & (~mask & 0xFF)
+            self._set_yx_bit(group, point, checked)
+
+    def _set_yx_bit(self, group: Group, point: Point, value: bool) -> None:
+        if point.kind != "YX" or not (0 <= point.inf < 8):
+            return
+        if point.fun >= len(group.data):
+            group.data.extend(
+                b"\x00" * (point.fun + 1 - len(group.data))
+            )
+        mask = 1 << point.inf
+        if value:
+            group.data[point.fun] = group.data[point.fun] | mask
+        else:
+            group.data[point.fun] = group.data[point.fun] & (~mask & 0xFF)
 
     def _on_yx_override(
         self, key: str, label: str, checked: bool
     ) -> None:
+        entry = self._yx_points.get(key)
         if checked:
             self._yx_overrides[key] = True
         else:
             self._yx_overrides.pop(key, None)
+            if entry is not None:
+                self._set_yx_bit(entry[0], entry[1], False)
         self._apply_yx_overrides()
         if self.category == "YX":
             self._refresh_current_values()
         self._log(
             "SIM",
-            f"遥信模拟: {label} = {'合' if checked else '自动'}",
+            f"遥信模拟: {label} = {'合' if checked else '分'}",
         )
 
     def _clear_yx_overrides(self) -> None:

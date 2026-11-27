@@ -272,6 +272,10 @@ def main() -> int:
         fmt.decode_raw(parse_hex("00 00 00 00 00 00 00 64")) == 100,
         "auto 8 字节按原始大端",
     )
+    check(
+        fmt.encode_eng(100.0, 1, 0.01) == parse_hex("64"),
+        "1 字节电量系数过大时回退原始值",
+    )
 
     point = Point("YC", "温度", 1, 17, 0, 2)
     key = point_key(point)
