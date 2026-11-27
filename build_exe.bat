@@ -28,7 +28,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-copy /Y README.md dist\ChargerSim\README.md >nul
+::copy /Y README.md dist\ChargerSim\README.md >nul
 
 echo.
 echo 打包完成：

@@ -216,7 +216,7 @@ class MainWindow(QMainWindow):
 
         self.yx_sim_group = QGroupBox("遥信模拟")
         yx_sim_layout = QVBoxLayout(self.yx_sim_group)
-        yx_sim_hint = QLabel("勾选=强制合；取消=清除并恢复模型计算")
+        yx_sim_hint = QLabel("勾选=置合位；不勾选=置分位。")
         yx_sim_hint.setStyleSheet("color: #777;")
         yx_sim_layout.addWidget(yx_sim_hint)
         self.yx_checks_host = QWidget()

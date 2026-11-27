@@ -25,3 +25,7 @@ data/battery_config.json
 data/preset*.json
 data/frames*.csv
 data/events*.txt
+
+#文档
+*.docx
+*.tmp

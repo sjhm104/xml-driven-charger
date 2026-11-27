@@ -44,7 +44,6 @@ class BatteryConfigDialog(QDialog):
         layout = QVBoxLayout(self)
         tip = QLabel(
             "配置值初始显示默认值；修改后才作为覆盖值保存。"
-            "遥测在 0x01 查询时生效，定值在 0x1B 读取时生效。"
         )
         tip.setWordWrap(True)
         layout.addWidget(tip)
@@ -81,7 +80,7 @@ class BatteryConfigDialog(QDialog):
 
         buttons = QHBoxLayout()
         buttons.addWidget(
-            QLabel("配置值按工程值填写，支持小数和负数。")
+            QLabel("配置值支持小数和负数。")
         )
         buttons.addStretch(1)
         self.clear_btn = QPushButton("恢复默认")
@@ -123,7 +122,7 @@ class BatteryConfigDialog(QDialog):
                 self.table.setItem(row, 0, name_item)
 
                 value_item = QTableWidgetItem("")
-                value_item.setToolTip("留空=自动；填写后按工程值写入")
+                value_item.setToolTip("留空=默认；填写后按工程值写入")
                 self.table.setItem(row, 1, value_item)
                 self._point_rows.append((key, point, value_item))
 
